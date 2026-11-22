@@ -6,7 +6,7 @@ DEV   ?= dev
 ANSWER ?= dev-answer
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: native fixtures-native build fixtures dev run-dev check-dev
+.PHONY: native fixtures-native fuzz build fixtures dev run-dev check-dev
 
 ## Build the binary on the host (needs g++ >= 11)
 native:
@@ -15,6 +15,10 @@ native:
 ## Run all 36 fixtures against the host binary
 fixtures-native: native
 	python3 scripts/run_fixtures.py fixtures -- build/pipeline
+
+## Fuzz the fast line splitter against the exact scalar one
+fuzz:
+	mkdir -p build && g++ -O2 -march=x86-64-v3 -std=c++17 -Wno-address-of-packed-member -o build/fuzz_split tests/fuzz_split.cpp -lpthread && build/fuzz_split
 
 ## Build the image for the scorer's platform
 build:
