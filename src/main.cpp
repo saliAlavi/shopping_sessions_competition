@@ -34,6 +34,7 @@ typedef uint32_t u32;
 typedef int64_t i64;
 typedef int32_t i32;
 typedef uint8_t u8;
+typedef uint16_t u16;
 
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -58,12 +59,19 @@ static bool VERBOSE = false;
 }
 
 // ------------------------------------------------------------------ memory
+static vector<pair<char*, size_t>> REGIONS;  // big mappings, released in parallel before exit
 static void* vmalloc(size_t n, bool huge) {
   n = (n + 4095) & ~(size_t)4095;
   if (n == 0) n = 4096;
   void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (p == MAP_FAILED) die("mmap anon");
   madvise(p, n, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+  if (n >= (1u << 20)) {
+    static atomic_flag lk = ATOMIC_FLAG_INIT;
+    while (lk.test_and_set(memory_order_acquire)) _mm_pause();
+    REGIONS.push_back({(char*)p, n});
+    lk.clear(memory_order_release);
+  }
   return p;
 }
 
@@ -192,7 +200,99 @@ static inline const char* split(const char* p, Fld* f, bool& ok) {
   return next_line(q);
 }
 
+// Continuous delimiter iterator: every byte of a chunk is classified once,
+// 64 bytes at a time; next() yields the positions of ',', '\n' and '"' in order.
+struct DIt {
+  const char* blk;
+  u64 m;
+  static inline u64 scan(const char* b) {
+    const __m256i c1 = _mm256_set1_epi8(','), c2 = _mm256_set1_epi8('\n'), c3 = _mm256_set1_epi8('"');
+    __m256i v0 = _mm256_loadu_si256((const __m256i*)b), v1 = _mm256_loadu_si256((const __m256i*)(b + 32));
+    u32 a = (u32)_mm256_movemask_epi8(_mm256_or_si256(
+        _mm256_or_si256(_mm256_cmpeq_epi8(v0, c1), _mm256_cmpeq_epi8(v0, c2)), _mm256_cmpeq_epi8(v0, c3)));
+    u32 b2 = (u32)_mm256_movemask_epi8(_mm256_or_si256(
+        _mm256_or_si256(_mm256_cmpeq_epi8(v1, c1), _mm256_cmpeq_epi8(v1, c2)), _mm256_cmpeq_epi8(v1, c3)));
+    return (u64)a | ((u64)b2 << 32);
+  }
+  inline void init(const char* p) {
+    blk = p;
+    m = scan(p);
+  }
+  inline const char* next() {
+    while (UNLIKELY(m == 0)) {
+      blk += 64;
+      m = scan(blk);
+    }
+    const char* r = blk + __builtin_ctzll(m);
+    m &= m - 1;
+    return r;
+  }
+};
+
+// Split the line starting at p into exactly K fields using the iterator.
+// On return p is the start of the next line. false = malformed line.
+template <int K>
+static inline bool split_it(const char*& p, DIt& it, Fld* f) {
+  const char* s = p;
+  const char* d;
+  for (int i = 0; i < K; i++) {
+    d = it.next();
+    if (*s == '"') {
+      // d == s: the opening quote
+      const char* q = it.next();
+      if (UNLIKELY(*q != '"')) {
+        d = q;
+        goto bad;
+      }
+      f[i].p = s + 1;
+      f[i].n = (u32)(q - s - 1);
+      d = it.next();
+      if (UNLIKELY(d != q + 1)) goto bad;
+    } else {
+      if (UNLIKELY(*d == '"')) goto bad;
+      f[i].p = s;
+      f[i].n = (u32)(d - s);
+    }
+    if (i < K - 1) {
+      if (UNLIKELY(*d != ',')) goto bad;
+      s = d + 1;
+    } else {
+      if (UNLIKELY(*d != '\n')) goto bad;
+      p = d + 1;
+      return true;
+    }
+  }
+bad:
+  while (*d != '\n') d = it.next();
+  p = d + 1;
+  return false;
+}
+
 // ------------------------------------------------------------------ timestamps
+static i32 YDAYS[131];      // days from 1970-01-01 to Jan 1 of 1970 + i
+static u16 MDAYS[2][13];    // days before month m
+static void init_date_tables() {
+  i32 acc = 0;
+  for (int i = 0; i < 131; i++) {
+    YDAYS[i] = acc;
+    int y = 1970 + i;
+    acc += ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 366 : 365;
+  }
+  static const int dm[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  for (int l = 0; l < 2; l++) {
+    int s = 0;
+    for (int m = 1; m <= 12; m++) {
+      MDAYS[l][m] = (u16)s;
+      s += dm[m] + (m == 2 ? l : 0);
+    }
+  }
+}
+static inline i64 days_from_civil(i64 y, unsigned m, unsigned d);
+static inline i64 civil_days(unsigned y, unsigned m, unsigned d, bool lp) {
+  if (LIKELY(y >= 1970 && y < 2101)) return YDAYS[y - 1970] + MDAYS[lp][m] + d - 1;
+  return days_from_civil(y, m, d);
+}
+
 static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
   y -= m <= 2;
   const i64 era = (y >= 0 ? y : y - 399) / 400;
@@ -252,7 +352,80 @@ static inline bool parse_ts(const char* p, u32 n, i64& out) {
 static inline i64 parse_f1_sec(const char* p) {
   unsigned y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14),
            s = d2(p + 17);
-  return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+  return civil_days(y, mo, d, leap(y)) * 86400 + h * 3600 + mi * 60 + s;
+}
+
+// ---- SIMD versions
+alignas(16) static const u8 KEEPMASK[32] = {0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                                            0,    0,    0,    0,    0,    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// F3: n digits (1..16) right-aligned; reads 16 bytes ending at p+n.
+static inline bool f3_simd(const char* p, u32 n, i64& out) {
+  __m128i v = _mm_loadu_si128((const __m128i*)(p + n - 16));
+  __m128i t = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+  __m128i keep = _mm_loadu_si128((const __m128i*)(KEEPMASK + n));
+  t = _mm_and_si128(t, keep);
+  if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t)) != 0xFFFF) return false;
+  __m128i m1 = _mm_maddubs_epi16(t, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+  __m128i m2 = _mm_madd_epi16(m1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+  __m128i m3 = _mm_packus_epi32(m2, m2);
+  __m128i m4 = _mm_madd_epi16(m3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+  u64 hi = (u32)_mm_cvtsi128_si32(m4), lo = (u32)_mm_extract_epi32(m4, 1);
+  out = (i64)(hi * 100000000ull + lo);
+  return true;
+}
+// "YYYY-MM-DDTHH:MM:SS" at p, validated; returns local seconds or -1.
+// digits at 0-3,5,6,8,9,11,12,14,15,17,18; separators at 4,7,10,13,16
+static inline i64 dt19_simd(const char* p) {
+  __m256i v = _mm256_loadu_si256((const __m256i*)p);
+  __m256i t = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+  u32 dig = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(t, _mm256_set1_epi8(9)), t));
+  const __m256i sep = _mm256_setr_epi8(0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0, ':', 0, 0, 0, 0,
+                                       0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  u32 sp = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, sep));
+  const u32 DIGM = 0x6DB6Fu;  // bits 0-3,5,6,8,9,11,12,14,15,17,18
+  const u32 SEPM = 0x12490u;  // bits 4,7,10,13,16
+  if (((dig & DIGM) | (sp & SEPM)) != (DIGM | SEPM)) return -1;
+  // pairs: (0,1)(2,3)(5,6)(8,9)(11,12)(14,15) from the low 16 bytes
+  __m128i lo = _mm256_castsi256_si128(t);
+  __m128i g = _mm_shuffle_epi8(lo, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+  __m128i pr = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+  alignas(16) u16 a[8];
+  _mm_store_si128((__m128i*)a, pr);
+  unsigned y = a[0] * 100u + a[1], mo = a[2], d = a[3], h = a[4], mi = a[5];
+  unsigned s = (unsigned)(p[17] - '0') * 10 + (unsigned)(p[18] - '0');
+  if (mo - 1 > 11 || d - 1 > 30 || h > 23 || mi > 59 || s > 59) return -1;
+  bool lp = leap(y);
+  if (d > (unsigned)(DIM[mo] + (mo == 2 && lp))) return -1;
+  return civil_days(y, mo, d, lp) * 86400 + h * 3600 + mi * 60 + s;
+}
+static inline bool parse_ts_fast(const char* p, u32 n, i64& out) {
+  if (n == 20) {
+    if (p[4] == '-') {
+      if (p[19] != 'Z') return false;
+      i64 s = dt19_simd(p);
+      if (s < 0) return false;
+      out = s * 1000;
+      return true;
+    }
+  } else if (n == 25) {
+    if (p[4] == '-') {
+      char sg = p[19];
+      if ((sg != '+' && sg != '-') || p[22] != ':' || !isdig(p[20]) || !isdig(p[21]) || !isdig(p[23]) ||
+          !isdig(p[24]))
+        return false;
+      unsigned oh = d2(p + 20), om = d2(p + 23);
+      if (oh > 23 || om > 59) return false;
+      i64 s = dt19_simd(p);
+      if (s < 0) return false;
+      i64 off = (i64)(oh * 60 + om) * 60;
+      if (sg == '-') off = -off;
+      out = (s - off) * 1000;
+      return true;
+    }
+  }
+  if (n >= 1 && n <= 16) return f3_simd(p, n, out);
+  return parse_ts(p, n, out);
 }
 
 // ------------------------------------------------------------------ files
@@ -529,18 +702,48 @@ static inline void for_lines(const Chunk& c, F fn) {
 }
 
 // ------------------------------------------------------------------ links
+// first line start at or after chunk begin (the header line is skipped)
+static inline const char* chunk_start(const Chunk& c) {
+  const char* d = c.f->data;
+  const char* p = d + c.b;
+  if (c.b == 0 || p[-1] != '\n') p = next_line(p);
+  return p;
+}
+
 static void parse_links_chunk(const Chunk& c, TL& tl) {
-  for_lines(c, [&](const char* p) {
+  const char* p = chunk_start(c);
+  const char* end = c.f->data + c.e;
+  if (p >= end) return;
+  DIt it;
+  it.init(p);
+  struct Pend {
+    u64 ha, hb;
+    const char *pa, *pb;
+    u32 na, nb;
+  } ring[8];
+  u32 head = 0, tail = 0;
+  auto finish = [&](const Pend& q) {
+    u32 a = uget<true>(q.ha, q.pa, q.na, tl.al);
+    u32 b = uget<true>(q.hb, q.pb, q.nb, tl.al);
+    if (a != b) tl.edges.push_back({a, b});
+  };
+  while (p < end) {
     Fld f[2];
-    bool ok;
-    const char* nx = split<2>(p, f, ok);
-    if (ok && f[0].n && f[1].n) {
-      u32 a = uget<true>(hash_str(f[0].p, f[0].n) | 1, f[0].p, f[0].n, tl.al);
-      u32 b = uget<true>(hash_str(f[1].p, f[1].n) | 1, f[1].p, f[1].n, tl.al);
-      if (a != b) tl.edges.push_back({a, b});
-    }
-    return nx;
-  });
+    bool ok = split_it<2>(p, it, f);
+    if (!ok || !f[0].n || !f[1].n) continue;
+    Pend q;
+    q.ha = hash_str(f[0].p, f[0].n) | 1;
+    q.hb = hash_str(f[1].p, f[1].n) | 1;
+    q.pa = f[0].p;
+    q.pb = f[1].p;
+    q.na = f[0].n;
+    q.nb = f[1].n;
+    _mm_prefetch((const char*)&UT[q.ha >> USHIFT], _MM_HINT_T0);
+    _mm_prefetch((const char*)&UT[q.hb >> USHIFT], _MM_HINT_T0);
+    if (tail - head == 7) finish(ring[head++ & 7]);
+    ring[tail++ & 7] = q;
+  }
+  while (head != tail) finish(ring[head++ & 7]);
 }
 
 static atomic<u32>* PARENT;
@@ -569,26 +772,38 @@ static inline void uf_union(u32 a, u32 b) {
 // ------------------------------------------------------------------ events / clicks
 static void parse_events_chunk(const Chunk& c, TL& tl) {
   const u32 p1shift = 64 - P1B;
-  i64 lines = 0;
-  for_lines(c, [&](const char* p) {
-    Fld f[7];
-    bool ok;
-    const char* nx = split<7>(p, f, ok);
-    lines++;
-    if (UNLIKELY(!ok || f[0].n == 0)) return nx;
-    u64 eh = hash_str(f[0].p, f[0].n);
+  const char* p = chunk_start(c);
+  const char* end = c.f->data + c.e;
+  if (p >= end) return;
+  DIt it;
+  it.init(p);
+  struct Pend {
+    u64 uh;
+    const char* up;
+    u32 un;
     ERec r;
-    r.eh = eh;
+  } ring[8];
+  u32 head = 0, tail = 0;
+  auto finish = [&](Pend& q) {
+    q.r.person = uget<false>(q.uh, q.up, q.un, tl.al);
+    tl.eb[q.r.eh >> p1shift].push(q.r);
+  };
+  i64 lines = 0;
+  while (p < end) {
+    Fld f[7];
+    bool ok = split_it<7>(p, it, f);
+    lines++;
+    if (UNLIKELY(!ok || f[0].n == 0)) continue;
+    ERec r;
+    r.eh = hash_str(f[0].p, f[0].n);
     r.person = 0;
     r.val = INVALID;
     i64 ing = parse_f1_sec(f[3].p);
     r.ingest = (u32)ing;
     do {
       if (UNLIKELY(f[1].n == 0 || f[5].n == 0)) break;
-      u64 uh = hash_str(f[1].p, f[1].n) | 1;
-      _mm_prefetch((const char*)&UT[uh >> USHIFT], _MM_HINT_T0);
       i64 ts;
-      if (UNLIKELY(!parse_ts(f[2].p, f[2].n, ts))) break;
+      if (UNLIKELY(!parse_ts_fast(f[2].p, f[2].n, ts))) break;
       if (UNLIKELY(ts < WS || ts >= WE)) break;
       if (UNLIKELY(ing * 1000 - ts > 86400000)) break;
       u32 pay;
@@ -618,38 +833,65 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
       } else {
         break;
       }
-      r.person = uget<false>(uh, f[1].p, f[1].n, tl.al);
       r.val = ((u64)(u32)(ts - WS) << 32) | pay;
     } while (0);
-    tl.eb[eh >> p1shift].push(r);
-    return nx;
-  });
+    if (r.val == INVALID) {
+      tl.eb[r.eh >> p1shift].push(r);
+      continue;
+    }
+    Pend q;
+    q.uh = hash_str(f[1].p, f[1].n) | 1;
+    _mm_prefetch((const char*)&UT[q.uh >> USHIFT], _MM_HINT_T0);
+    q.up = f[1].p;
+    q.un = f[1].n;
+    q.r = r;
+    if (tail - head == 7) finish(ring[head++ & 7]);
+    ring[tail++ & 7] = q;
+  }
+  while (head != tail) finish(ring[head++ & 7]);
   tl.n_ev_lines += lines;
 }
 
 static void parse_clicks_chunk(const Chunk& c, TL& tl) {
-  i64 lines = 0;
-  for_lines(c, [&](const char* p) {
-    Fld f[4];
-    bool ok;
-    const char* nx = split<4>(p, f, ok);
-    lines++;
-    if (UNLIKELY(!ok || f[0].n == 0 || f[1].n == 0)) return nx;
-    u64 uh = hash_str(f[1].p, f[1].n) | 1;
-    _mm_prefetch((const char*)&UT[uh >> USHIFT], _MM_HINT_T0);
-    i64 ts;
-    if (!parse_ts(f[3].p, f[3].n, ts)) return nx;
-    if (ts < CWS || ts >= WE) return nx;
-    u32 cmp = CAMP.find(f[2].p, f[2].n);
-    if (cmp == ~0u) return nx;
-    u32 person = uget<false>(uh, f[1].p, f[1].n, tl.al);
+  const char* p = chunk_start(c);
+  const char* end = c.f->data + c.e;
+  if (p >= end) return;
+  DIt it;
+  it.init(p);
+  struct Pend {
+    u64 uh;
+    const char* up;
+    u32 un;
     CRec r;
-    r.person = person;
-    r.ts = (u32)(ts - CWS);
-    r.ref = ((u64)(f[0].p - BASE) << 16) | cmp;
-    tl.cb[person & (P2 - 1)].push(r);
-    return nx;
-  });
+  } ring[8];
+  u32 head = 0, tail = 0;
+  auto finish = [&](Pend& q) {
+    u32 person = uget<false>(q.uh, q.up, q.un, tl.al);
+    q.r.person = person;
+    tl.cb[person & (P2 - 1)].push(q.r);
+  };
+  i64 lines = 0;
+  while (p < end) {
+    Fld f[4];
+    bool ok = split_it<4>(p, it, f);
+    lines++;
+    if (UNLIKELY(!ok || f[0].n == 0 || f[1].n == 0)) continue;
+    i64 ts;
+    if (!parse_ts_fast(f[3].p, f[3].n, ts)) continue;
+    if (ts < CWS || ts >= WE) continue;
+    u32 cmp = CAMP.find(f[2].p, f[2].n);
+    if (cmp == ~0u) continue;
+    Pend q;
+    q.uh = hash_str(f[1].p, f[1].n) | 1;
+    _mm_prefetch((const char*)&UT[q.uh >> USHIFT], _MM_HINT_T0);
+    q.up = f[1].p;
+    q.un = f[1].n;
+    q.r.ts = (u32)(ts - CWS);
+    q.r.ref = ((u64)(f[0].p - BASE) << 16) | cmp;
+    if (tail - head == 7) finish(ring[head++ & 7]);
+    ring[tail++ & 7] = q;
+  }
+  while (head != tail) finish(ring[head++ & 7]);
   tl.n_cl_lines += lines;
 }
 
@@ -1138,6 +1380,7 @@ static void load_small_table(const string& path, vector<pair<string, string>>& r
 
 int main() {
   T0 = now_s();
+  init_date_tables();
   VERBOSE = getenv("VERBOSE") != nullptr;
   const char* e;
   string DATA = (e = getenv("DATA_DIR")) ? e : "/data";
@@ -1224,7 +1467,7 @@ int main() {
   }
   double est_ev = ebytes / ev_line + 1000, est_cl = cbytes / cl_line + 1000;
   P1B = 4;
-  while (P1B < 13 && (est_ev / (1u << P1B)) > 16384) P1B++;
+  while (P1B < 13 && (est_ev / (1u << P1B)) > 40000) P1B++;
   P2B = 4;
   while (P2B < 12 && (est_ev / (1u << P2B)) > 32768) P2B++;
   P1 = 1u << P1B;
@@ -1233,7 +1476,7 @@ int main() {
   // user table + id space
   {
     double lines = est_ev + est_cl + (double)lb / 10.0;
-    u64 want = (u64)(lines / 5) + 65536;
+    u64 want = (u64)(lines / 8) + 65536;
     int bits = 16;
     while ((1ull << bits) < want) bits++;
     UT = (Slot*)vmalloc(sizeof(Slot) << bits, true);
@@ -1510,7 +1753,23 @@ int main() {
     write_parquet(cd + "/part-0.parquet", rows, cols);
   }
   LOG("output written");
-  // skip destructors / munmap of the big mappings
+  // Tearing ~10 GB of mappings down at exit is serial in the kernel; dropping the
+  // pages with MADV_DONTNEED (mmap_lock held for read) runs on every thread at once.
+  {
+    const size_t SL = 64ull << 20;
+    vector<pair<char*, size_t>> slices;
+    for (auto& r : REGIONS)
+      for (size_t o = 0; o < r.second; o += SL) slices.push_back({r.first + o, min(SL, r.second - o)});
+    atomic<size_t> nx{0};
+    parallel([&](int t) {
+      for (;;) {
+        size_t i = nx.fetch_add(1);
+        if (i >= slices.size()) break;
+        madvise(slices[i].first, slices[i].second, MADV_DONTNEED);
+      }
+    });
+  }
+  LOG("released");
   fflush(stderr);
   _exit(0);
 }
