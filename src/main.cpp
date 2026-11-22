@@ -311,15 +311,25 @@ struct DIt2 {
 };
 
 template <int K>
-static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* f) {
+static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict f) {
+  // iterator state in registers (f[] stores cannot alias it)
+  const char* blk = it.blk;
+  u64 m = it.m, q = it.q;
+  i64 qcum = it.qcum;
   const char* ls = p;
   const char* s = p;
   const char* d = nullptr;
   u32 bad = 0;
-  i64 qexp = 0;
+  u32 nq = 0;
 #pragma GCC unroll 8
   for (int i = 0; i < K; i++) {
-    d = it.next();
+    while (UNLIKELY(m == 0)) {
+      qcum += __builtin_popcountll(q);
+      blk += 64;
+      DIt2::scan(blk, m, q);
+    }
+    d = blk + __builtin_ctzll(m);
+    m &= m - 1;
     char c = *d;
     if (i < K - 1)
       bad |= (u32)(c != ',');
@@ -331,11 +341,16 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* f) {
     bad |= (qs ^ qe) | (qs & (u32)(len < 2));
     f[i].p = s + qs;
     f[i].n = len - 2 * qs;
-    qexp += 2 * qs;
+    nq += qs;
     s = d + 1;
   }
-  i64 qend = it.qbefore(d);
-  bad |= (u32)((qend - qstart) != qexp);
+  u32 o = (u32)(d - blk);
+  i64 qend = qcum + __builtin_popcountll(q & ((1ull << o) - 1));
+  bad |= (u32)((qend - qstart) != (i64)(2 * nq));
+  it.blk = blk;
+  it.m = m;
+  it.q = q;
+  it.qcum = qcum;
   if (LIKELY(!bad)) {
     qstart = qend;
     p = d + 1;
@@ -963,7 +978,11 @@ struct TL {  // thread-local state
   };
   BB o_uid, o_day, o_sess, o_ev, o_rev, o_top, o_def;
   u64 o_rows = 0;
-  vector<i64> c_sess, c_psess, c_rev, c_assist;  // [(camp)*ND + day]
+  struct CC {
+    u32 sess, psess, assist, pad;
+    i64 rev;
+  };
+  vector<CC> cc;  // [(camp)*ND + day]
   i64 n_ev_lines = 0, n_cl_lines = 0;
 };
 static vector<TL> TLS;
@@ -1346,10 +1365,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   vector<u32>& active = sc.active;
   i64* catsum = sc.catsum.data();
   vector<u32>& touched = sc.touched;
-  i64* c_sess = tl.c_sess.data();
-  i64* c_psess = tl.c_psess.data();
-  i64* c_rev = tl.c_rev.data();
-  i64* c_assist = tl.c_assist.data();
+  TL::CC* CCA = tl.cc.data();
 
   u32 eprev = 0, cprev = 0;
   for (u32 li = 0; li < NL; li++) {
@@ -1510,14 +1526,15 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
           if (clickid_cmp(C[k].off, C[best].off) < 0) best = k;
         }
         credit = C[best].camp;
-        for (u32 cp : active) c_assist[(size_t)cp * ND + day]++;
+        for (u32 cp : active) CCA[(size_t)cp * ND + day].assist++;
       } else {
         credit = NCAMP;  // organic
       }
       size_t ix = (size_t)credit * ND + day;
-      c_sess[ix]++;
-      if (purch) c_psess[ix]++;
-      c_rev[ix] += rev;
+      TL::CC& e = CCA[ix];
+      e.sess++;
+      e.psess += purch;
+      e.rev += rev;
     }
     flush();
     // clear window state
@@ -2116,10 +2133,7 @@ int main() {
     size_t csz = (size_t)(NCAMP + 1) * ND;
     parallel([&](int t) {
       TL& tl = TLS[t];
-      tl.c_sess.assign(csz, 0);
-      tl.c_psess.assign(csz, 0);
-      tl.c_rev.assign(csz, 0);
-      tl.c_assist.assign(csz, 0);
+      tl.cc.assign(csz, TL::CC{0, 0, 0, 0, 0});
       SessCtx sc;
       sc.ccnt.assign(NCAMP + 1, 0);
       sc.apos.assign(NCAMP + 1, 0);
@@ -2179,10 +2193,10 @@ int main() {
     vector<i64> cs(csz, 0), cps(csz, 0), crev(csz, 0), cas(csz, 0);
     for (auto& tl : TLS)
       for (size_t i = 0; i < csz; i++) {
-        cs[i] += tl.c_sess[i];
-        cps[i] += tl.c_psess[i];
-        crev[i] += tl.c_rev[i];
-        cas[i] += tl.c_assist[i];
+        cs[i] += tl.cc[i].sess;
+        cps[i] += tl.cc[i].psess;
+        crev[i] += tl.cc[i].rev;
+        cas[i] += tl.cc[i].assist;
       }
     vector<string> cdat(7);
     u64 rows = 0;
