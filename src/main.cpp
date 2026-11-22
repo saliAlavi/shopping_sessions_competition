@@ -805,8 +805,21 @@ static inline bool name_less(u32 a, u32 b) {
 // thread-local bump arena for overflow blocks (released with the other regions)
 static thread_local char* AR_P = nullptr;
 static thread_local size_t AR_LEFT = 0;
+// memory of dead buffers (already faulted in) offered for reuse before fresh pages
+static thread_local vector<pair<char*, size_t>> RECY;
 static void* arena_alloc(size_t n) {
   n = (n + 63) & ~(size_t)63;
+  while (!RECY.empty()) {
+    auto& c = RECY.back();
+    char* a = (char*)(((uintptr_t)c.first + 63) & ~(uintptr_t)63);
+    size_t skip = (size_t)(a - c.first);
+    if (c.second >= skip + n) {
+      c.first = a + n;
+      c.second -= skip + n;
+      return a;
+    }
+    RECY.pop_back();
+  }
   if (AR_LEFT < n) {
     size_t sz = max(n, (size_t)64 << 20);
     AR_P = (char*)vmalloc(sz, true);
@@ -878,13 +891,24 @@ struct WC {
     }
     cnt[k] = (u8)c;
   }
+  static inline void stream(T* dstp, const T* sg) {
+    const __m256i* src = (const __m256i*)sg;
+    __m256i* dst = (__m256i*)dstp;
+    for (size_t i = 0; i < sizeof(T) * G / 32; i++) _mm256_stream_si256(dst + i, _mm256_load_si256(src + i));
+  }
   void flush_full(size_t k, T* sg) {
     Buf<T>& b = (*bufs)[k];
     if (LIKELY(b.ob.empty() && b.n + G <= b.cap)) {
-      const __m256i* src = (const __m256i*)sg;
-      __m256i* dst = (__m256i*)(b.d + b.n);
-      for (size_t i = 0; i < sizeof(T) * G / 32; i++) _mm256_stream_si256(dst + i, _mm256_load_si256(src + i));
+      stream(b.d + b.n, sg);
       b.n += G;
+    } else if (b.n == b.cap && (b.on % G) == 0) {
+      // stream into overflow blocks (OB is a multiple of G, blocks are 64-byte aligned)
+      if (b.ob.empty() || b.on == Buf<T>::OB) {
+        b.ob.push_back((T*)arena_alloc(sizeof(T) * Buf<T>::OB));
+        b.on = 0;
+      }
+      stream(b.ob.back() + b.on, sg);
+      b.on += G;
     } else {
       for (int i = 0; i < G; i++) b.push(sg[i]);
     }
@@ -2066,7 +2090,7 @@ int main() {
     atomic<u32> next{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
-      init_bufs_var(tl.pb, pcaps);
+      tl.pb.assign(P2, Buf<PE>());  // block lists; blocks come from recycled event slices
       tl.pbw.init(tl.pb);
       vector<u64> tab;  // (tag << 32) | (thread << 26 | index); empty = ~0
       auto rec = [&](u32 p, u32 code) -> ERec& {
@@ -2119,6 +2143,11 @@ int main() {
           TLS[s].eb[p].each([&](const ERec& r) {
             if (r.val != INVALID) tl.pbw.push(r.person >> P2S, PE{r.person, r.val});
           });
+        // this partition's event slices are dead now: reuse them for the person blocks
+        for (int s = 0; s < NT; s++) {
+          Buf<ERec>& b = TLS[s].eb[p];
+          if (b.cap) RECY.push_back({(char*)b.d, (size_t)b.cap * sizeof(ERec)});
+        }
       }
       tl.pbw.finish();
     });
