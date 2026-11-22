@@ -699,7 +699,7 @@ struct DirectIds {
     for (auto& e : ids) {
       u64 v;
       canon(e.first.data(), (u32)e.first.size(), pre, v);
-      val[v] = e.second;
+      if (val[v] == ~0u) val[v] = e.second;
     }
     ok = true;
   }
@@ -1815,6 +1815,14 @@ int main() {
     int bits = 16;
     while ((1ull << bits) < want) bits++;
     UT = (Slot*)vmalloc(sizeof(Slot) << bits, true);
+    {
+      // fault the table in with sequential parallel sweeps (random first-touch faults are far slower)
+      size_t nb = sizeof(Slot) << bits;
+      parallel([&](int t) {
+        size_t per = ((nb / NT) + 4095) & ~(size_t)4095;
+        for (size_t o = (size_t)t * per; o < min(nb, (size_t)(t + 1) * per); o += 4096) ((volatile char*)UT)[o] = 0;
+      });
+    }
     UBITS = bits;
     UMASK = (1ull << bits) - 1;
     USHIFT = 64 - bits;
@@ -1845,16 +1853,21 @@ int main() {
       CATLP.push_back(lp + c);
     }
     UNKNOWN_CAT = (u32)(lower_bound(cats.begin(), cats.end(), string("unknown")) - cats.begin());
-    PROD.init(rows.size() + 1);
     vector<pair<string, u32>> ids;
+    ids.reserve(rows.size());
     for (auto& r : rows) {
       u32 ci = (u32)(lower_bound(cats.begin(), cats.end(), r.second) - cats.begin());
-      string key = r.first;
-      key.append(16, '\0');
-      u32 got = PROD.insert(key.data(), (u32)r.first.size(), ci);
-      ids.push_back({r.first, got});
+      ids.push_back({r.first, ci});
     }
     PRODD.build(ids, "p");
+    if (!PRODD.ok) {  // general fallback map, only when ids are not all canonical
+      PROD.init(rows.size() + 1);
+      for (auto& r : ids) {
+        string key = r.first;
+        key.append(16, '\0');
+        PROD.insert(key.data(), (u32)r.first.size(), r.second);
+      }
+    }
   }
   // campaigns
   {
