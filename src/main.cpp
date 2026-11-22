@@ -1226,6 +1226,7 @@ struct SessCtx {
   vector<u64> sorttmp;
   vector<u64> ev;
   vector<Cl> cl;
+  vector<u8> ra, rb;  // radix scratch (12-byte records)
   vector<u32> cnt, ccount;
 };
 
@@ -1235,12 +1236,49 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   vector<u32>& cnt = sc.cnt;
   cnt.assign(NL + 1, 0);
   size_t ne = 0;
-  for (int t = 0; t < NT; t++) {
-    const Buf<PE>& b = TLS[t].pb[p];
-    b.each([&](const PE& x) { cnt[x.person & LMASK]++; });
-    ne += b.size();
-  }
+  for (int t = 0; t < NT; t++) ne += TLS[t].pb[p].size();
   if (ne == 0) return;
+  if (sc.ev.size() < ne) sc.ev.resize(ne);
+  u64* ev = sc.ev.data();
+  // LSD radix sort of (person, ts): three passes on ts, then a stable counting
+  // scatter by person, so every person's events come out sorted by ts.
+  struct __attribute__((packed)) RE {
+    u64 val;
+    u32 loc;
+  };
+  if (sc.ra.size() < ne * sizeof(RE)) {
+    sc.ra.resize(ne * sizeof(RE) + 64);
+    sc.rb.resize(ne * sizeof(RE) + 64);
+  }
+  RE* A = (RE*)sc.ra.data();
+  RE* B = (RE*)sc.rb.data();
+  // Sessions never split inside a 2^20 ms (17.5 min < 30 min) bucket, so events only
+  // need grouping by (person, ts >> 20): one counting pass on the bucket, then the
+  // stable person scatter. The walk below handles buckets as units.
+  static thread_local u32 h0[2048];
+  memset(h0, 0, sizeof h0);
+  {
+    size_t i = 0;
+    for (int t = 0; t < NT; t++)
+      TLS[t].pb[p].each([&](const PE& x) {
+        u64 v = x.val;
+        u32 l = x.person & LMASK;
+        A[i].val = v;
+        A[i].loc = l;
+        i++;
+        h0[(v >> 52) & 2047]++;
+        cnt[l]++;
+      });
+  }
+  {
+    u32 a = 0;
+    for (int i = 0; i < 2048; i++) {
+      u32 x = h0[i];
+      h0[i] = a;
+      a += x;
+    }
+  }
+  for (size_t i = 0; i < ne; i++) B[h0[(A[i].val >> 52) & 2047]++] = A[i];
   u32 s = 0;
   for (u32 i = 0; i < NL; i++) {
     u32 c = cnt[i];
@@ -1248,9 +1286,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
     s += c;
   }
   cnt[NL] = s;
-  if (sc.ev.size() < ne) sc.ev.resize(ne);
-  u64* ev = sc.ev.data();
-  for (int t = 0; t < NT; t++) TLS[t].pb[p].each([&](const PE& x) { ev[cnt[x.person & LMASK]++] = x.val; });
+  for (size_t i = 0; i < ne; i++) ev[cnt[B[i].loc]++] = B[i].val;
   // now cnt[i] = end of local i; start = cnt[i-1] (end of previous)
 
   vector<u32>& cc = sc.ccount;
@@ -1297,7 +1333,6 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
     u32 nlen = NAMEN[person];
     u64* E = ev + eb;
     u32 n = eend - eb;
-    sort_u64(E, n, sc.sorttmp);
     Cl* C = cl + cb;
     u32 m = cend - cb;
     if (m > 1) {
@@ -1357,8 +1392,26 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
       }
       tl.o_rows++;
     };
+    // bucket [i, j): events with equal ts >> 20, in any order; returns j, sets min/max
+    auto bucket = [&](u32 b0, u32& mn, u32& mx) -> u32 {
+      u32 t = (u32)(E[b0] >> 32);
+      u32 key = t >> 20;
+      mn = mx = t;
+      u32 j = b0 + 1;
+      while (j < n) {
+        u32 u = (u32)(E[j] >> 32);
+        if ((u >> 20) != key) break;
+        mn = u < mn ? u : mn;
+        mx = u > mx ? u : mx;
+        j++;
+      }
+      return j;
+    };
+    u32 nb_min = 0, nb_max = 0, nb_end = 0;
+    if (n) nb_end = bucket(0, nb_min, nb_max);
     while (i < n) {
-      u32 st = (u32)(E[i] >> 32);
+      // a session starts with the pending bucket [i, nb_end)
+      u32 st = nb_min;
       i32 day = (i32)((WS + st) / 86400000 - DAY0);
       if (day != curday) {
         flush();
@@ -1367,24 +1420,31 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
         d_ev = 0;
         d_rev = 0;
       }
-      u32 last = st;
+      u32 last = nb_max;
+      u32 j = nb_end;
+      while (j < n) {
+        u32 bmn, bmx;
+        u32 e2 = bucket(j, bmn, bmx);
+        if (bmn - last > GAP) {
+          nb_min = bmn;
+          nb_max = bmx;
+          nb_end = e2;
+          break;
+        }
+        last = bmx;
+        j = e2;
+      }
       i64 rev = 0;
       bool purch = false;
-      u32 j = i;
-      while (j < n) {
-        u64 x = E[j];
-        u32 t = (u32)(x >> 32);
-        if (t - last > GAP) break;
-        last = t;
-        u32 pl = (u32)x;
-        if ((pl >> 30) == 2) {
+      for (u32 k = i; k < j; k++) {
+        u32 pl = (u32)E[k];
+        if (UNLIKELY((pl >> 30) == 2)) {
           u32 price = pl & 0xFFFFFF, cat = (pl >> 24) & 63;
           rev += price;
           purch = true;
           if (catsum[cat] == 0) touched.push_back(cat);
           catsum[cat] += price;
         }
-        j++;
       }
       d_sess++;
       d_ev += (i32)(j - i);
