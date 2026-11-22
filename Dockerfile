@@ -7,7 +7,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY src/ /src/
-RUN g++ -O2 -march=x86-64-v3 -std=c++17 -static -o /pipeline main.cpp -lpthread
+RUN g++ -O3 -march=x86-64-v3 -std=c++17 -static -o /pipeline main.cpp -lpthread
 
 FROM debian:bookworm-slim
 COPY --from=build /pipeline /app/pipeline

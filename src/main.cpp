@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -100,7 +101,7 @@ static inline u64 mum(u64 a, u64 b) {
   return (u64)r ^ (u64)(r >> 64);
 }
 // Reads up to 7 bytes past the end of the string: every buffer is padded.
-static inline u64 hash_str(const char* p, u32 n) {
+__attribute__((always_inline)) static inline u64 hash_str(const char* p, u32 n) {
   const u64 s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull, s2 = 0x8ebc6af09c88c6e3ull,
             s3 = 0x589965cc75374cc3ull;
   u64 seed = s0 ^ ((u64)n * s3);
@@ -268,6 +269,85 @@ bad:
   return false;
 }
 
+// Delimiter iterator over ',' and '\n' only, plus a running count of '"'.
+// Fields are split by commas alone (no value holds a comma), quotes are checked
+// arithmetically: each field is either unquoted with no '"' or "...", and the
+// line's quote count must be exactly twice the number of quoted fields.
+struct DIt2 {
+  const char* blk;
+  u64 m, q;
+  i64 qcum;
+  static inline void scan(const char* b, u64& d, u64& qq) {
+    const __m256i c1 = _mm256_set1_epi8(','), c2 = _mm256_set1_epi8('\n'), c3 = _mm256_set1_epi8('"');
+    __m256i v0 = _mm256_loadu_si256((const __m256i*)b), v1 = _mm256_loadu_si256((const __m256i*)(b + 32));
+    u32 d0 = (u32)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v0, c1), _mm256_cmpeq_epi8(v0, c2)));
+    u32 d1 = (u32)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v1, c1), _mm256_cmpeq_epi8(v1, c2)));
+    u32 q0 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c3));
+    u32 q1 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c3));
+    d = (u64)d0 | ((u64)d1 << 32);
+    qq = (u64)q0 | ((u64)q1 << 32);
+  }
+  inline void init(const char* p) {
+    blk = p;
+    qcum = 0;
+    scan(p, m, q);
+  }
+  inline const char* next() {
+    while (UNLIKELY(m == 0)) {
+      qcum += __builtin_popcountll(q);
+      blk += 64;
+      scan(blk, m, q);
+    }
+    const char* r = blk + __builtin_ctzll(m);
+    m &= m - 1;
+    return r;
+  }
+  // quotes in [init position, x), x inside the current block
+  inline i64 qbefore(const char* x) const {
+    u32 o = (u32)(x - blk);
+    return qcum + __builtin_popcountll(q & ((1ull << o) - 1));
+  }
+};
+
+template <int K>
+static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* f) {
+  const char* ls = p;
+  const char* s = p;
+  const char* d = nullptr;
+  u32 bad = 0;
+  i64 qexp = 0;
+#pragma GCC unroll 8
+  for (int i = 0; i < K; i++) {
+    d = it.next();
+    char c = *d;
+    if (i < K - 1)
+      bad |= (u32)(c != ',');
+    else
+      bad |= (u32)(c != '\n');
+    u32 qs = (u32)(s[0] == '"');
+    u32 qe = (u32)(d[-1] == '"');
+    u32 len = (u32)(d - s);
+    bad |= (qs ^ qe) | (qs & (u32)(len < 2));
+    f[i].p = s + qs;
+    f[i].n = len - 2 * qs;
+    qexp += 2 * qs;
+    s = d + 1;
+  }
+  i64 qend = it.qbefore(d);
+  bad |= (u32)((qend - qstart) != qexp);
+  if (LIKELY(!bad)) {
+    qstart = qend;
+    p = d + 1;
+    return true;
+  }
+  // malformed (or misaligned by a wrong field count): resync at the true line end
+  const char* le = next_line(ls);
+  it.init(le);
+  qstart = 0;
+  p = le;
+  return false;
+}
+
 // ------------------------------------------------------------------ timestamps
 static i32 YDAYS[131];      // days from 1970-01-01 to Jan 1 of 1970 + i
 static u16 MDAYS[2][13];    // days before month m
@@ -376,7 +456,7 @@ static inline bool f3_simd(const char* p, u32 n, i64& out) {
 }
 // "YYYY-MM-DDTHH:MM:SS" at p, validated; returns local seconds or -1.
 // digits at 0-3,5,6,8,9,11,12,14,15,17,18; separators at 4,7,10,13,16
-static inline i64 dt19_simd(const char* p) {
+__attribute__((always_inline)) static inline i64 dt19_simd(const char* p) {
   __m256i v = _mm256_loadu_si256((const __m256i*)p);
   __m256i t = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
   u32 dig = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(t, _mm256_set1_epi8(9)), t));
@@ -541,6 +621,7 @@ static int ND;    // number of days
 static SMap PROD;  // product -> category index
 static SMap CAMP;  // campaign -> index
 static vector<string> CATS;
+static vector<string> CATLP;  // length-prefixed category names
 static vector<string> CHANNELS, CAMPIDS;
 static u32 UNKNOWN_CAT;
 static u32 NCAMP;
@@ -655,8 +736,8 @@ struct CRec {  // valid click, partitioned by person
 // payload: [type:2][cat:6][price:24]
 static inline u32 mkpay(u32 type, u32 cat, u32 price) { return (type << 30) | (cat << 24) | price; }
 
-static int P1B, P2B;  // log2 partitions
-static u32 P1, P2;
+static int P1B, P2S;  // log2 event partitions; persons per partition = 1 << P2S (range partitioning)
+static u32 P1, P2, P2USED;
 
 struct TL {  // thread-local state
   vector<Buf<ERec>> eb;
@@ -665,10 +746,24 @@ struct TL {  // thread-local state
   vector<pair<u32, u32>> edges;
   IdAlloc al;
   // outputs
-  vector<u32> o_person;
-  vector<i32> o_day, o_sess, o_ev;
-  vector<i64> o_rev;
-  vector<int8_t> o_top;
+  // user_daily columns, built in place (PLAIN encoding)
+  struct BB {
+    char* p = nullptr;
+    size_t n = 0, cap = 0;
+    inline void need(size_t k) {
+      if (UNLIKELY(n + k > cap)) {
+        size_t c = cap ? cap * 2 : (1 << 16);
+        while (c < n + k) c *= 2;
+        p = (char*)realloc(p, c);
+        cap = c;
+      }
+    }
+    inline void put32(u32 v) { memcpy(p + n, &v, 4); n += 4; }
+    inline void put64(u64 v) { memcpy(p + n, &v, 8); n += 8; }
+    inline void put(const char* s, size_t k) { memcpy(p + n, s, k); n += k; }
+  };
+  BB o_uid, o_day, o_sess, o_ev, o_rev, o_top, o_def;
+  u64 o_rows = 0;
   vector<i64> c_sess, c_psess, c_rev, c_assist;  // [(camp)*ND + day]
   i64 n_ev_lines = 0, n_cl_lines = 0;
 };
@@ -714,8 +809,9 @@ static void parse_links_chunk(const Chunk& c, TL& tl) {
   const char* p = chunk_start(c);
   const char* end = c.f->data + c.e;
   if (p >= end) return;
-  DIt it;
+  DIt2 it;
   it.init(p);
+  i64 qs0 = 0;
   struct Pend {
     u64 ha, hb;
     const char *pa, *pb;
@@ -729,7 +825,7 @@ static void parse_links_chunk(const Chunk& c, TL& tl) {
   };
   while (p < end) {
     Fld f[2];
-    bool ok = split_it<2>(p, it, f);
+    bool ok = split2<2>(p, it, qs0, f);
     if (!ok || !f[0].n || !f[1].n) continue;
     Pend q;
     q.ha = hash_str(f[0].p, f[0].n) | 1;
@@ -775,8 +871,9 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
   const char* p = chunk_start(c);
   const char* end = c.f->data + c.e;
   if (p >= end) return;
-  DIt it;
+  DIt2 it;
   it.init(p);
+  i64 qs0 = 0;
   struct Pend {
     u64 uh;
     const char* up;
@@ -791,7 +888,7 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
   i64 lines = 0;
   while (p < end) {
     Fld f[7];
-    bool ok = split_it<7>(p, it, f);
+    bool ok = split2<7>(p, it, qs0, f);
     lines++;
     if (UNLIKELY(!ok || f[0].n == 0)) continue;
     ERec r;
@@ -856,8 +953,9 @@ static void parse_clicks_chunk(const Chunk& c, TL& tl) {
   const char* p = chunk_start(c);
   const char* end = c.f->data + c.e;
   if (p >= end) return;
-  DIt it;
+  DIt2 it;
   it.init(p);
+  i64 qs0 = 0;
   struct Pend {
     u64 uh;
     const char* up;
@@ -868,12 +966,12 @@ static void parse_clicks_chunk(const Chunk& c, TL& tl) {
   auto finish = [&](Pend& q) {
     u32 person = uget<false>(q.uh, q.up, q.un, tl.al);
     q.r.person = person;
-    tl.cb[person & (P2 - 1)].push(q.r);
+    tl.cb[person >> P2S].push(q.r);
   };
   i64 lines = 0;
   while (p < end) {
     Fld f[4];
-    bool ok = split_it<4>(p, it, f);
+    bool ok = split2<4>(p, it, qs0, f);
     lines++;
     if (UNLIKELY(!ok || f[0].n == 0 || f[1].n == 0)) continue;
     i64 ts;
@@ -962,13 +1060,14 @@ struct SessCtx {
 };
 
 static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
+  const u32 LMASK = NL - 1;
   // gather events, counting sort by local person
   vector<u32>& cnt = sc.cnt;
   cnt.assign(NL + 1, 0);
   size_t ne = 0;
   for (int t = 0; t < NT; t++) {
     const Buf<PE>& b = TLS[t].pb[p];
-    b.each([&](const PE& x) { cnt[x.person >> P2B]++; });
+    b.each([&](const PE& x) { cnt[x.person & LMASK]++; });
     ne += b.size();
   }
   if (ne == 0) return;
@@ -981,7 +1080,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   cnt[NL] = s;
   if (sc.ev.size() < ne) sc.ev.resize(ne);
   u64* ev = sc.ev.data();
-  for (int t = 0; t < NT; t++) TLS[t].pb[p].each([&](const PE& x) { ev[cnt[x.person >> P2B]++] = x.val; });
+  for (int t = 0; t < NT; t++) TLS[t].pb[p].each([&](const PE& x) { ev[cnt[x.person & LMASK]++] = x.val; });
   // now cnt[i] = end of local i; start = cnt[i-1] (end of previous)
 
   vector<u32>& cc = sc.ccount;
@@ -989,7 +1088,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   size_t nc = 0;
   for (int t = 0; t < NT; t++) {
     const Buf<CRec>& b = TLS[t].cb[p];
-    b.each([&](const CRec& x) { cc[x.person >> P2B]++; });
+    b.each([&](const CRec& x) { cc[x.person & LMASK]++; });
     nc += b.size();
   }
   s = 0;
@@ -1003,7 +1102,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   Cl* cl = sc.cl.data();
   for (int t = 0; t < NT; t++)
     TLS[t].cb[p].each([&](const CRec& x) {
-      cl[cc[x.person >> P2B]++] = Cl{x.ts, (u32)(x.ref & 0xFFFF), x.ref >> 16};
+      cl[cc[x.person & LMASK]++] = Cl{x.ts, (u32)(x.ref & 0xFFFF), x.ref >> 16};
     });
 
   u32* ccnt = sc.ccnt.data();
@@ -1023,7 +1122,9 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
     eprev = eend;
     cprev = cend;
     if (eend == eb) continue;
-    u32 person = (li << P2B) | p;
+    u32 person = (p << P2S) | li;
+    const char* nptr = NAMEP[person];
+    u32 nlen = NAMEN[person];
     u64* E = ev + eb;
     u32 n = eend - eb;
     sort_u64(E, n, sc.sorttmp);
@@ -1063,12 +1164,28 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
         catsum[c] = 0;
       }
       touched.clear();
-      tl.o_person.push_back(person);
-      tl.o_day.push_back((i32)(DAY0 + curday));
-      tl.o_sess.push_back(d_sess);
-      tl.o_ev.push_back(d_ev);
-      tl.o_rev.push_back(d_rev);
-      tl.o_top.push_back(top);
+      tl.o_uid.need(4 + nlen);
+      tl.o_uid.put32(nlen);
+      tl.o_uid.put(nptr, nlen);
+      tl.o_day.need(4);
+      tl.o_day.put32((u32)(i32)(DAY0 + curday));
+      tl.o_sess.need(4);
+      tl.o_sess.put32((u32)d_sess);
+      tl.o_ev.need(4);
+      tl.o_ev.put32((u32)d_ev);
+      tl.o_rev.need(8);
+      tl.o_rev.put64((u64)d_rev);
+      if ((tl.o_rows & 7) == 0) {
+        tl.o_def.need(1);
+        tl.o_def.p[tl.o_def.n++] = 0;
+      }
+      if (top >= 0) {
+        tl.o_def.p[tl.o_def.n - 1] |= (char)(1 << (tl.o_rows & 7));
+        const string& cs = CATLP[(size_t)top];
+        tl.o_top.need(cs.size());
+        tl.o_top.put(cs.data(), cs.size());
+      }
+      tl.o_rows++;
     };
     while (i < n) {
       u32 st = (u32)(E[i] >> 32);
@@ -1216,23 +1333,24 @@ struct PCol {
   int ptype;
   int ltype;
   bool optional;
-  string data;  // page payload (def levels + values)
+  vector<pair<const char*, size_t>> parts;  // page payload pieces (def levels + values)
 };
 
 static void put32(string& s, u32 v) { s.append((const char*)&v, 4); }
 static void put64(string& s, u64 v) { s.append((const char*)&v, 8); }
 
 static void write_parquet(const string& path, u64 nrows, vector<PCol>& cols) {
-  string out;
-  out.reserve(64);
-  out += "PAR1";
+  vector<string> hdr(cols.size());
   vector<i64> offs(cols.size()), sizes(cols.size());
+  i64 off = 4;
   for (size_t ci = 0; ci < cols.size(); ci++) {
     PCol& c = cols[ci];
+    size_t dsz = 0;
+    for (auto& pr : c.parts) dsz += pr.second;
     TW ph;
     ph.i32f(1, 0);  // DATA_PAGE
-    ph.i32f(2, (i32)c.data.size());
-    ph.i32f(3, (i32)c.data.size());
+    ph.i32f(2, (i32)dsz);
+    ph.i32f(3, (i32)dsz);
     ph.sbeg(5);
     ph.i32f(1, (i32)nrows);
     ph.i32f(2, 0);  // PLAIN
@@ -1240,11 +1358,10 @@ static void write_parquet(const string& path, u64 nrows, vector<PCol>& cols) {
     ph.i32f(4, 3);  // RLE
     ph.send();
     ph.byte(0);
-    offs[ci] = (i64)out.size();
-    out += ph.b;
-    out += c.data;
-    sizes[ci] = (i64)(ph.b.size() + c.data.size());
-    string().swap(c.data);
+    hdr[ci] = ph.b;
+    offs[ci] = off;
+    sizes[ci] = (i64)(ph.b.size() + dsz);
+    off += sizes[ci];
   }
   TW m;
   m.i32f(1, 1);
@@ -1308,39 +1425,42 @@ static void write_parquet(const string& path, u64 nrows, vector<PCol>& cols) {
   }
   m.strf(6, "shopping-sessions-native");
   m.byte(0);
-  out += m.b;
-  put32(out, (u32)m.b.size());
-  out += "PAR1";
+  string tail = m.b;
+  put32(tail, (u32)m.b.size());
+  tail += "PAR1";
+  vector<iovec> iov;
+  iov.push_back({(void*)"PAR1", 4});
+  if (nrows > 0)
+    for (size_t ci = 0; ci < cols.size(); ci++) {
+      iov.push_back({(void*)hdr[ci].data(), hdr[ci].size()});
+      for (auto& pr : cols[ci].parts)
+        if (pr.second) iov.push_back({(void*)pr.first, pr.second});
+    }
+  iov.push_back({(void*)tail.data(), tail.size()});
+  if (nrows == 0) {
+    // no row group: drop the (unreferenced) pages, keep offsets irrelevant
+  }
   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) die("open output");
-  size_t w = 0;
-  while (w < out.size()) {
-    ssize_t k = write(fd, out.data() + w, out.size() - w);
-    if (k <= 0) die("write output");
-    w += (size_t)k;
+  size_t i = 0;
+  while (i < iov.size()) {
+    int cnt = (int)min((size_t)512, iov.size() - i);
+    ssize_t k = writev(fd, &iov[i], cnt);
+    if (k < 0) die("write output");
+    size_t done = (size_t)k;
+    while (done > 0 && i < iov.size()) {
+      if (done >= iov[i].iov_len) {
+        done -= iov[i].iov_len;
+        i++;
+      } else {
+        iov[i].iov_base = (char*)iov[i].iov_base + done;
+        iov[i].iov_len -= done;
+        done = 0;
+      }
+    }
+    while (i < iov.size() && iov[i].iov_len == 0) i++;
   }
   close(fd);
-}
-
-static string deflevels(const vector<int8_t>& present) {
-  // RLE/bit-packed hybrid, bit width 1, one bit-packed run; 4-byte length prefix
-  size_t n = present.size();
-  size_t groups = (n + 7) / 8;
-  string r;
-  u64 hdr = ((u64)groups << 1) | 1;
-  string v;
-  while (hdr >= 0x80) {
-    v.push_back((char)(hdr | 0x80));
-    hdr >>= 7;
-  }
-  v.push_back((char)hdr);
-  size_t base = v.size();
-  v.resize(base + groups, 0);
-  for (size_t i = 0; i < n; i++)
-    if (present[i]) v[base + i / 8] |= (char)(1 << (i % 8));
-  put32(r, (u32)v.size());
-  r += v;
-  return r;
 }
 
 // ------------------------------------------------------------------ main
@@ -1410,6 +1530,12 @@ int main() {
     cats.erase(unique(cats.begin(), cats.end()), cats.end());
     if (cats.size() > 64) die("too many categories");
     CATS = cats;
+    for (auto& c : cats) {
+      string lp(4, '\0');
+      u32 n = (u32)c.size();
+      memcpy(&lp[0], &n, 4);
+      CATLP.push_back(lp + c);
+    }
     UNKNOWN_CAT = (u32)(lower_bound(cats.begin(), cats.end(), string("unknown")) - cats.begin());
     PROD.init(rows.size() + 1);
     for (auto& r : rows) {
@@ -1468,10 +1594,8 @@ int main() {
   double est_ev = ebytes / ev_line + 1000, est_cl = cbytes / cl_line + 1000;
   P1B = 4;
   while (P1B < 13 && (est_ev / (1u << P1B)) > 40000) P1B++;
-  P2B = 4;
-  while (P2B < 12 && (est_ev / (1u << P2B)) > 32768) P2B++;
+  if (getenv("P1B")) P1B = atoi(getenv("P1B"));
   P1 = 1u << P1B;
-  P2 = 1u << P2B;
 
   // user table + id space
   {
@@ -1486,7 +1610,17 @@ int main() {
     if (MAXID > 0xFFFFFFF0ull) MAXID = 0xFFFFFFF0ull;
     NAMEP = (const char**)vmalloc(sizeof(char*) * MAXID, false);
     NAMEN = (u32*)vmalloc(sizeof(u32) * MAXID, false);
-    LOG("P1=%u P2=%u utable=2^%d est_ev=%.0f est_cl=%.0f", P1, P2, bits, est_ev, est_cl);
+    // person partitions are id ranges of 1 << P2S; ids never exceed the table capacity
+    // (plus partially used allocation blocks), so P2 partitions cover every id.
+    double est_ids = est_ev / 12.0 + 1024;
+    double want_parts = est_ev / 24000.0;
+    P2S = 6;
+    while (P2S < 20 && est_ids / (double)(1u << P2S) > want_parts) P2S++;
+    if (getenv("P2S")) P2S = atoi(getenv("P2S"));
+    P2 = (u32)((((1ull << bits) + (u64)NT * 4096 + 65536) >> P2S) + 1);
+    P2USED = (u32)(est_ids / (double)(1u << P2S)) + 1;
+    LOG("P1=%u P2=%u (used ~%u, 2^%d persons each) utable=2^%d est_ev=%.0f est_cl=%.0f", P1, P2, P2USED, P2S, bits,
+        est_ev, est_cl);
   }
 
   TLS.resize(NT);
@@ -1566,7 +1700,7 @@ int main() {
   // ---------------- phase 3: events + clicks
   {
     size_t ecap = (size_t)(est_ev / NT / P1 * 1.3) + 64;
-    size_t ccap = (size_t)(est_cl / NT / P2 * 1.3) + 64;
+    size_t ccap = (size_t)(est_cl / NT / P2USED * 1.4) + 64;
     parallel([&](int t) {
       init_bufs(TLS[t].eb, P1, ecap);
       init_bufs(TLS[t].cb, P2, ccap);
@@ -1593,16 +1727,17 @@ int main() {
   // ---------------- phase 4: dedup
   {
     size_t est_surv = (size_t)(est_ev * 0.97);
-    size_t pcap = (size_t)(est_surv / NT / P2 * 1.3) + 64;
+    size_t pcap = (size_t)(est_surv / NT / P2USED * 1.4) + 64;
     atomic<u32> next{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
       init_bufs(tl.pb, P2, pcap);
-      struct DT {
-        u64 eh;
-        const ERec* r;
+      vector<u64> tab;  // (tag << 32) | (thread << 26 | index); empty = ~0
+      auto rec = [&](u32 p, u32 code) -> ERec& {
+        Buf<ERec>& b = TLS[code >> 26].eb[p];
+        u32 i = code & ((1u << 26) - 1);
+        return i < b.n ? b.d[i] : b.ov[i - b.n];
       };
-      vector<DT> tab;
       for (;;) {
         u32 p = next.fetch_add(1);
         if (p >= P1) break;
@@ -1610,30 +1745,44 @@ int main() {
         for (int s = 0; s < NT; s++) n += TLS[s].eb[p].size();
         size_t cap = 64;
         while (cap < n * 2) cap <<= 1;
-        tab.assign(cap, DT{0, nullptr});
+        tab.assign(cap, ~0ull);
         u64 mask = cap - 1;
+        // pass 1: keep the smallest ingest_ts per event_id, mark every other copy INVALID
         for (int s = 0; s < NT; s++) {
-          TLS[s].eb[p].each([&](const ERec& r) {
-            u64 i = r.eh & mask;
+          Buf<ERec>& b = TLS[s].eb[p];
+          size_t tot = b.size();
+          for (size_t i = 0; i < tot; i++) {
+            ERec& r = i < b.n ? b.d[i] : b.ov[i - b.n];
+            u32 tag = (u32)(r.eh >> 20);
+            u64 k = r.eh & mask;
+            u64 me = ((u64)tag << 32) | ((u32)s << 26) | (u32)i;
             for (;;) {
-              DT& d = tab[i];
-              if (!d.r) {
-                d.eh = r.eh;
-                d.r = &r;
+              u64 e = tab[k];
+              if (e == ~0ull) {
+                tab[k] = me;
                 break;
               }
-              if (d.eh == r.eh) {
-                if (r.ingest < d.r->ingest) d.r = &r;
-                break;
+              if ((u32)(e >> 32) == tag) {
+                ERec& o = rec(p, (u32)e);
+                if (o.eh == r.eh) {
+                  if (r.ingest < o.ingest) {
+                    o.val = INVALID;
+                    tab[k] = me;
+                  } else {
+                    r.val = INVALID;
+                  }
+                  break;
+                }
               }
-              i = (i + 1) & mask;
+              k = (k + 1) & mask;
             }
+          }
+        }
+        // pass 2: sequential scatter of the surviving valid copies by person range
+        for (int s = 0; s < NT; s++)
+          TLS[s].eb[p].each([&](const ERec& r) {
+            if (r.val != INVALID) tl.pb[r.person >> P2S].push(PE{r.person, r.val});
           });
-        }
-        for (size_t i = 0; i < cap; i++) {
-          const ERec* r = tab[i].r;
-          if (r && r->val != INVALID) tl.pb[r->person & (P2 - 1)].push(PE{r->person, r->val});
-        }
       }
     });
   }
@@ -1641,7 +1790,8 @@ int main() {
 
   // ---------------- phase 5: sessions
   {
-    u32 NL = (NIDS >> P2B) + 1;
+    u32 NL = 1u << P2S;
+    if (NIDS > ((u64)P2 << P2S)) die("id range");
     vector<pair<size_t, u32>> order(P2);
     for (u32 p = 0; p < P2; p++) {
       size_t n = 0;
@@ -1679,38 +1829,30 @@ int main() {
     atomic<int> wrote{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
-      size_t n = tl.o_person.size();
+      u64 n = tl.o_rows;
       if (n == 0 && t != 0) return;
       vector<PCol> cols(6);
-      cols[0] = PCol{"user_id", PT_BYTES, LT_STRING, false, string()};
-      cols[1] = PCol{"day", PT_INT32, LT_DATE, false, string()};
-      cols[2] = PCol{"sessions", PT_INT32, LT_NONE, false, string()};
-      cols[3] = PCol{"events", PT_INT32, LT_NONE, false, string()};
-      cols[4] = PCol{"revenue_cents", PT_INT64, LT_NONE, false, string()};
-      cols[5] = PCol{"top_category", PT_BYTES, LT_STRING, true, string()};
-      size_t namebytes = 0;
-      for (size_t i = 0; i < n; i++) namebytes += NAMEN[tl.o_person[i]] + 4;
-      string& c0 = cols[0].data;
-      c0.reserve(namebytes);
-      for (size_t i = 0; i < n; i++) {
-        u32 pid = tl.o_person[i];
-        put32(c0, NAMEN[pid]);
-        c0.append(NAMEP[pid], NAMEN[pid]);
-      }
-      cols[1].data.assign((const char*)tl.o_day.data(), n * 4);
-      cols[2].data.assign((const char*)tl.o_sess.data(), n * 4);
-      cols[3].data.assign((const char*)tl.o_ev.data(), n * 4);
-      cols[4].data.assign((const char*)tl.o_rev.data(), n * 8);
-      vector<int8_t> present(n);
-      for (size_t i = 0; i < n; i++) present[i] = tl.o_top[i] >= 0;
-      string& c5 = cols[5].data;
-      c5 = deflevels(present);
-      for (size_t i = 0; i < n; i++)
-        if (tl.o_top[i] >= 0) {
-          const string& s = CATS[(size_t)tl.o_top[i]];
-          put32(c5, (u32)s.size());
-          c5 += s;
+      cols[0] = PCol{"user_id", PT_BYTES, LT_STRING, false, {{tl.o_uid.p, tl.o_uid.n}}};
+      cols[1] = PCol{"day", PT_INT32, LT_DATE, false, {{tl.o_day.p, tl.o_day.n}}};
+      cols[2] = PCol{"sessions", PT_INT32, LT_NONE, false, {{tl.o_sess.p, tl.o_sess.n}}};
+      cols[3] = PCol{"events", PT_INT32, LT_NONE, false, {{tl.o_ev.p, tl.o_ev.n}}};
+      cols[4] = PCol{"revenue_cents", PT_INT64, LT_NONE, false, {{tl.o_rev.p, tl.o_rev.n}}};
+      // def levels: [u32 len][varint (groups<<1)|1][bit-packed groups]
+      string dh;
+      {
+        u64 groups = (n + 7) / 8;
+        u64 hv = (groups << 1) | 1;
+        string v;
+        while (hv >= 0x80) {
+          v.push_back((char)(hv | 0x80));
+          hv >>= 7;
         }
+        v.push_back((char)hv);
+        put32(dh, (u32)(v.size() + groups));
+        dh += v;
+      }
+      cols[5] = PCol{"top_category", PT_BYTES, LT_STRING, true,
+                     {{dh.data(), dh.size()}, {tl.o_def.p, (size_t)((n + 7) / 8)}, {tl.o_top.p, tl.o_top.n}}};
       write_parquet(ud + "/part-" + to_string(t) + ".parquet", n, cols);
       wrote++;
     });
@@ -1724,32 +1866,31 @@ int main() {
         crev[i] += tl.c_rev[i];
         cas[i] += tl.c_assist[i];
       }
-    vector<PCol> cols(7);
-    cols[0] = PCol{"campaign_id", PT_BYTES, LT_STRING, false, string()};
-    cols[1] = PCol{"channel", PT_BYTES, LT_STRING, false, string()};
-    cols[2] = PCol{"day", PT_INT32, LT_DATE, false, string()};
-    cols[3] = PCol{"sessions", PT_INT64, LT_NONE, false, string()};
-    cols[4] = PCol{"purchasing_sessions", PT_INT64, LT_NONE, false, string()};
-    cols[5] = PCol{"revenue_cents", PT_INT64, LT_NONE, false, string()};
-    cols[6] = PCol{"assisted_sessions", PT_INT64, LT_NONE, false, string()};
+    vector<string> cdat(7);
     u64 rows = 0;
     for (u32 c = 0; c <= NCAMP; c++)
       for (int d = 0; d < ND; d++) {
         size_t i = (size_t)c * ND + d;
         if (cs[i] == 0 && cas[i] == 0) continue;
-        const string& id = c == NCAMP ? string("organic") : CAMPIDS[c];
-        const string& ch = c == NCAMP ? string("organic") : CHANNELS[c];
-        put32(cols[0].data, (u32)id.size());
-        cols[0].data += id;
-        put32(cols[1].data, (u32)ch.size());
-        cols[1].data += ch;
-        put32(cols[2].data, (u32)(i32)(DAY0 + d));
-        put64(cols[3].data, (u64)cs[i]);
-        put64(cols[4].data, (u64)cps[i]);
-        put64(cols[5].data, (u64)crev[i]);
-        put64(cols[6].data, (u64)cas[i]);
+        const string id = c == NCAMP ? string("organic") : CAMPIDS[c];
+        const string ch = c == NCAMP ? string("organic") : CHANNELS[c];
+        put32(cdat[0], (u32)id.size());
+        cdat[0] += id;
+        put32(cdat[1], (u32)ch.size());
+        cdat[1] += ch;
+        put32(cdat[2], (u32)(i32)(DAY0 + d));
+        put64(cdat[3], (u64)cs[i]);
+        put64(cdat[4], (u64)cps[i]);
+        put64(cdat[5], (u64)crev[i]);
+        put64(cdat[6], (u64)cas[i]);
         rows++;
       }
+    const char* names[7] = {"campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents",
+                            "assisted_sessions"};
+    const int pts[7] = {PT_BYTES, PT_BYTES, PT_INT32, PT_INT64, PT_INT64, PT_INT64, PT_INT64};
+    const int lts[7] = {LT_STRING, LT_STRING, LT_DATE, LT_NONE, LT_NONE, LT_NONE, LT_NONE};
+    vector<PCol> cols(7);
+    for (int k = 0; k < 7; k++) cols[k] = PCol{names[k], pts[k], lts[k], false, {{cdat[k].data(), cdat[k].size()}}};
     write_parquet(cd + "/part-0.parquet", rows, cols);
   }
   LOG("output written");

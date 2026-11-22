@@ -10,7 +10,7 @@ export IMAGE CPUS MEM PLATFORM
 
 ## Build the binary on the host (needs g++ >= 11)
 native:
-	mkdir -p build && g++ -O2 -march=x86-64-v3 -std=c++17 -o build/pipeline src/main.cpp -lpthread
+	mkdir -p build && g++ -O3 -march=x86-64-v3 -std=c++17 -o build/pipeline src/main.cpp -lpthread
 
 ## Run all 36 fixtures against the host binary
 fixtures-native: native
