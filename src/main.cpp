@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <malloc.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -694,10 +695,12 @@ struct Slot {
 static Slot* UT;
 static u64 UMASK;
 static int USHIFT;
+static int UBITS;
 static atomic<u32> NEXT_ID{0};
 static const char** NAMEP;
 static u32* NAMEN;
 static u32* SLOT_OF;
+static u64* PFX;  // big-endian 8-byte prefix of each link-phase id, for fast byte-wise compares
 static u64 MAXID;
 
 struct IdAlloc {
@@ -729,7 +732,11 @@ static inline u32 uget(u64 h, const char* p, u32 n, IdAlloc& al) {
         u32 id = al.next();
         NAMEP[id] = p;
         NAMEN[id] = n;
-        if (LINK) SLOT_OF[id] = (u32)i;
+        if (LINK) {
+          SLOT_OF[id] = (u32)i;
+          u64 w = n >= 8 ? ld64(p) : (n ? (ld64(p) & (~0ull >> (64 - 8 * n))) : 0);
+          PFX[id] = __builtin_bswap64(w);
+        }
         s.pid.store(id + 1, memory_order_release);
         return id;
       }
@@ -747,23 +754,55 @@ static inline bool name_less(u32 a, u32 b) {
 }
 
 // ------------------------------------------------------------------ record buffers
+// thread-local bump arena for overflow blocks (released with the other regions)
+static thread_local char* AR_P = nullptr;
+static thread_local size_t AR_LEFT = 0;
+static void* arena_alloc(size_t n) {
+  n = (n + 63) & ~(size_t)63;
+  if (AR_LEFT < n) {
+    size_t sz = max(n, (size_t)64 << 20);
+    AR_P = (char*)vmalloc(sz, true);
+    AR_LEFT = sz;
+  }
+  void* r = AR_P;
+  AR_P += n;
+  AR_LEFT -= n;
+  return r;
+}
+
 template <class T>
 struct Buf {
+  // a fixed slice, then fixed-size overflow blocks from a thread-local bump arena
+  static const u32 OB = 4096;
   T* d = nullptr;
   u32 n = 0, cap = 0;
-  vector<T> ov;
+  vector<T*> ob;
+  u32 on = 0;
   inline void push(const T& x) {
     if (LIKELY(n < cap))
       d[n++] = x;
     else
-      ov.push_back(x);
+      push_ov(x);
   }
+  void push_ov(const T& x) {
+    if (ob.empty() || on == OB) {
+      ob.push_back((T*)arena_alloc(sizeof(T) * OB));
+      on = 0;
+    }
+    ob.back()[on++] = x;
+  }
+  inline size_t ovsize() const { return ob.empty() ? 0 : (ob.size() - 1) * (size_t)OB + on; }
+  inline size_t size() const { return n + ovsize(); }
+  inline T& at(size_t i) { return i < n ? d[i] : ob[(i - n) / OB][(i - n) % OB]; }
   template <class F>
   inline void each(F f) const {
     for (u32 i = 0; i < n; i++) f(d[i]);
-    for (const T& x : ov) f(x);
+    for (size_t b = 0; b < ob.size(); b++) {
+      u32 m = b + 1 == ob.size() ? on : OB;
+      const T* q = ob[b];
+      for (u32 i = 0; i < m; i++) f(q[i]);
+    }
   }
-  size_t size() const { return n + ov.size(); }
 };
 
 // Write-combining scatter: G records per partition are staged in a small cache-resident
@@ -793,7 +832,7 @@ struct WC {
   }
   void flush_full(size_t k, T* sg) {
     Buf<T>& b = (*bufs)[k];
-    if (LIKELY(b.ov.empty() && b.n + G <= b.cap)) {
+    if (LIKELY(b.ob.empty() && b.n + G <= b.cap)) {
       const __m256i* src = (const __m256i*)sg;
       __m256i* dst = (__m256i*)(b.d + b.n);
       for (size_t i = 0; i < sizeof(T) * G / 32; i++) _mm256_stream_si256(dst + i, _mm256_load_si256(src + i));
@@ -815,6 +854,22 @@ struct WC {
     cnt = nullptr;
   }
 };
+
+// variable capacity per partition
+template <class T>
+static void init_bufs_var(vector<Buf<T>>& v, const vector<size_t>& caps) {
+  size_t parts = caps.size(), tot = 0;
+  v.resize(parts);
+  for (size_t c : caps) tot += (c + 15) & ~(size_t)15;
+  T* mem = (T*)vmalloc(sizeof(T) * tot + 64, true);
+  size_t o = 0;
+  for (size_t i = 0; i < parts; i++) {
+    size_t c = (caps[i] + 15) & ~(size_t)15;
+    v[i].d = mem + o;
+    v[i].cap = (u32)c;
+    o += c;
+  }
+}
 
 template <class T>
 static void init_bufs(vector<Buf<T>>& v, size_t parts, size_t cap) {
@@ -857,6 +912,7 @@ struct TL {  // thread-local state
   WC<PE, 16> pbw;
   WC<CRec, 4> cbw;
   vector<pair<u32, u32>> edges;
+  vector<u32> phist;  // valid event copies per person partition
   IdAlloc al;
   // outputs
   // user_daily columns, built in place (PLAIN encoding)
@@ -996,6 +1052,7 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
   u32 head = 0, tail = 0;
   auto finish = [&](Pend& q) {
     q.r.person = uget<false>(q.uh, q.up, q.un, tl.al);
+    tl.phist[q.r.person >> P2S]++;
     tl.ebw.push(q.r.eh >> p1shift, q.r);
   };
   i64 lines = 0;
@@ -1613,6 +1670,7 @@ static void load_small_table(const string& path, vector<pair<string, string>>& r
 
 int main() {
   T0 = now_s();
+  mallopt(M_MMAP_THRESHOLD, 1 << 20);  // big blocks go straight back to the kernel when freed
   init_date_tables();
   VERBOSE = getenv("VERBOSE") != nullptr;
   const char* e;
@@ -1632,6 +1690,36 @@ int main() {
     ND = (int)((WE - 1) / 86400000 - DAY0 + 1);
     if (WE - CWS >= (1LL << 32)) die("window too long");
   }
+
+  // files
+  vector<File> lf = list_csv(DATA + "/links"), ef = list_csv(DATA + "/events"), cf = list_csv(DATA + "/clicks");
+  vector<File*> all;
+  size_t lb = 0, ebytes = 0, cbytes = 0;
+  for (auto& f : lf) all.push_back(&f), lb += f.size;
+  for (auto& f : ef) all.push_back(&f), ebytes += f.size;
+  for (auto& f : cf) all.push_back(&f), cbytes += f.size;
+  map_files(all);
+  LOG("mapped %zu files: links %zu, events %zu, clicks %zu bytes", all.size(), lb, ebytes, cbytes);
+
+  // user table + id space
+  {
+    double lines = ebytes / 75.0 + cbytes / 50.0 + (double)lb / 10.0;
+    u64 want = (u64)(lines / 8) + 65536;
+    int bits = 16;
+    while ((1ull << bits) < want) bits++;
+    UT = (Slot*)vmalloc(sizeof(Slot) << bits, true);
+    UBITS = bits;
+    UMASK = (1ull << bits) - 1;
+    USHIFT = 64 - bits;
+    MAXID = (u64)(ebytes / 30 + cbytes / 8 + lb / 2) + (u64)NT * 4096 + 65536;
+    if (MAXID > 0xFFFFFFF0ull) MAXID = 0xFFFFFFF0ull;
+    NAMEP = (const char**)vmalloc(sizeof(char*) * MAXID, false);
+    NAMEN = (u32*)vmalloc(sizeof(u32) * MAXID, false);
+  }
+
+  // small tables and size estimates: done by thread 0 while the others parse links
+  double est_ev = 0, est_cl = 0;
+  auto small_job = [&]() {
   // products & categories
   {
     vector<pair<string, string>> rows;
@@ -1683,18 +1771,6 @@ int main() {
     }
     if (NCAMP >= 65535) die("too many campaigns");
   }
-  LOG("small tables: %zu cats, %u campaigns, %d days", CATS.size(), NCAMP, ND);
-
-  // files
-  vector<File> lf = list_csv(DATA + "/links"), ef = list_csv(DATA + "/events"), cf = list_csv(DATA + "/clicks");
-  vector<File*> all;
-  size_t lb = 0, ebytes = 0, cbytes = 0;
-  for (auto& f : lf) all.push_back(&f), lb += f.size;
-  for (auto& f : ef) all.push_back(&f), ebytes += f.size;
-  for (auto& f : cf) all.push_back(&f), cbytes += f.size;
-  map_files(all);
-  LOG("mapped %zu files: links %zu, events %zu, clicks %zu bytes", all.size(), lb, ebytes, cbytes);
-
   // estimates
   double ev_line = 75, cl_line = 50;
   {
@@ -1712,25 +1788,14 @@ int main() {
     ev_line = sample(ef, ev_line);
     cl_line = sample(cf, cl_line);
   }
-  double est_ev = ebytes / ev_line + 1000, est_cl = cbytes / cl_line + 1000;
+  est_ev = ebytes / ev_line + 1000;
+  est_cl = cbytes / cl_line + 1000;
   P1B = 4;
   while (P1B < 13 && (est_ev / (1u << P1B)) > 40000) P1B++;
   if (getenv("P1B")) P1B = atoi(getenv("P1B"));
   P1 = 1u << P1B;
 
-  // user table + id space
   {
-    double lines = est_ev + est_cl + (double)lb / 10.0;
-    u64 want = (u64)(lines / 8) + 65536;
-    int bits = 16;
-    while ((1ull << bits) < want) bits++;
-    UT = (Slot*)vmalloc(sizeof(Slot) << bits, true);
-    UMASK = (1ull << bits) - 1;
-    USHIFT = 64 - bits;
-    MAXID = (u64)(ebytes / 30 + cbytes / 8 + lb / 2) + (u64)NT * 4096 + 65536;
-    if (MAXID > 0xFFFFFFF0ull) MAXID = 0xFFFFFFF0ull;
-    NAMEP = (const char**)vmalloc(sizeof(char*) * MAXID, false);
-    NAMEN = (u32*)vmalloc(sizeof(u32) * MAXID, false);
     // person partitions are id ranges of 1 << P2S; ids never exceed the table capacity
     // (plus partially used allocation blocks), so P2 partitions cover every id.
     double est_ids = est_ev / 12.0 + 1024;
@@ -1738,11 +1803,13 @@ int main() {
     P2S = 6;
     while (P2S < 20 && est_ids / (double)(1u << P2S) > want_parts) P2S++;
     if (getenv("P2S")) P2S = atoi(getenv("P2S"));
-    P2 = (u32)((((1ull << bits) + (u64)NT * 4096 + 65536) >> P2S) + 1);
+    P2 = (u32)((((1ull << UBITS) + (u64)NT * 4096 + 65536) >> P2S) + 1);
     P2USED = (u32)(est_ids / (double)(1u << P2S)) + 1;
-    LOG("P1=%u P2=%u (used ~%u, 2^%d persons each) utable=2^%d est_ev=%.0f est_cl=%.0f", P1, P2, P2USED, P2S, bits,
+    LOG("P1=%u P2=%u (used ~%u, 2^%d persons each) utable=2^%d est_ev=%.0f est_cl=%.0f", P1, P2, P2USED, P2S, UBITS,
         est_ev, est_cl);
   }
+    LOG("small tables: %zu cats, %u campaigns, %d days", CATS.size(), NCAMP, ND);
+  };
 
   TLS.resize(NT);
 
@@ -1750,11 +1817,13 @@ int main() {
   {
     u64 maxl = (u64)(lb / 2) + (u64)NT * 2048 + 1024;
     SLOT_OF = (u32*)vmalloc(sizeof(u32) * maxl, false);
+    PFX = (u64*)vmalloc(sizeof(u64) * maxl, false);
     vector<Chunk> ch;
     make_chunks(lf, 0, 1 << 20, ch);
     atomic<size_t> next{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
+      if (t == 0 || NT == 1) small_job();
       for (;;) {
         size_t i = next.fetch_add(1);
         if (i >= ch.size()) break;
@@ -1778,29 +1847,29 @@ int main() {
         MINN[i].store((u32)i, memory_order_relaxed);
       }
     });
+    LOG("uf: init");
     parallel([&](int t) {
       for (auto& e2 : TLS[t].edges) uf_union(e2.first, e2.second);
     });
+    LOG("uf: union");
     parallel([&](int t) {
       size_t per = (L + NT - 1) / NT;
       for (size_t i = t * per; i < min((size_t)L, (t + 1) * per); i++) {
         if (!NAMEP[i]) continue;
         u32 r = uf_find((u32)i);
         if (r == i) continue;
+        UT[SLOT_OF[i]].pid.store(r + 1, memory_order_relaxed);
+        u64 mine = PFX[i];
         u32 cur = MINN[r].load(memory_order_relaxed);
-        while (name_less((u32)i, cur)) {
+        for (;;) {
+          u64 other = PFX[cur];
+          bool less = mine < other || (mine == other && name_less((u32)i, cur));
+          if (!less) break;
           if (MINN[r].compare_exchange_weak(cur, (u32)i, memory_order_relaxed)) break;
         }
       }
     });
-    parallel([&](int t) {
-      size_t per = (L + NT - 1) / NT;
-      for (size_t i = t * per; i < min((size_t)L, (t + 1) * per); i++) {
-        if (!NAMEP[i]) continue;
-        u32 r = uf_find((u32)i);
-        if (r != i) UT[SLOT_OF[i]].pid.store(r + 1, memory_order_relaxed);
-      }
-    });
+    LOG("uf: minname+slots");
     parallel([&](int t) {
       size_t per = (L + NT - 1) / NT;
       for (size_t i = t * per; i < min((size_t)L, (t + 1) * per); i++) {
@@ -1818,32 +1887,47 @@ int main() {
   }
   LOG("union-find done");
 
-  // ---------------- phase 3: events + clicks
+  // ---------------- phase 3: events, then clicks
+  vector<size_t> vpart(P2, 0);  // valid event copies per person partition
   {
     const double capf = getenv("CAPF") ? atof(getenv("CAPF")) : 1.0;  // test knob: shrink to exercise overflow paths
     size_t ecap = (size_t)(est_ev / NT / P1 * 1.3 * capf) + 64;
-    size_t ccap = (size_t)(est_cl / NT / P2USED * 1.4 * capf) + 64;
-    parallel([&](int t) {
-      init_bufs(TLS[t].eb, P1, ecap);
-      init_bufs(TLS[t].cb, P2, ccap);
-      TLS[t].ebw.init(TLS[t].eb);
-      TLS[t].cbw.init(TLS[t].cb);
-    });
     vector<Chunk> ch;
     make_chunks(ef, 1, 4 << 20, ch);
-    make_chunks(cf, 2, 4 << 20, ch);
     atomic<size_t> next{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
+      init_bufs(tl.eb, P1, ecap);
+      tl.ebw.init(tl.eb);
+      tl.phist.assign(P2, 0);
       for (;;) {
         size_t i = next.fetch_add(1);
         if (i >= ch.size()) break;
-        if (ch[i].kind == 1)
-          parse_events_chunk(ch[i], tl);
-        else
-          parse_clicks_chunk(ch[i], tl);
+        parse_events_chunk(ch[i], tl);
       }
       tl.ebw.finish();
+    });
+    size_t tot = 0;
+    for (auto& tl : TLS)
+      for (u32 k = 0; k < P2; k++) vpart[k] += tl.phist[k];
+    for (size_t v : vpart) tot += v;
+    LOG("events parsed");
+    // clicks: per-partition capacity follows the event distribution
+    vector<size_t> ccaps(P2);
+    for (u32 k = 0; k < P2; k++)
+      ccaps[k] = (size_t)(est_cl * ((double)vpart[k] / (double)(tot + 1)) / NT * 1.5 * capf) + 32;
+    vector<Chunk> cch;
+    make_chunks(cf, 2, 4 << 20, cch);
+    atomic<size_t> cnext{0};
+    parallel([&](int t) {
+      TL& tl = TLS[t];
+      init_bufs_var(tl.cb, ccaps);
+      tl.cbw.init(tl.cb);
+      for (;;) {
+        size_t i = cnext.fetch_add(1);
+        if (i >= cch.size()) break;
+        parse_clicks_chunk(cch[i], tl);
+      }
       tl.cbw.finish();
     });
   }
@@ -1854,17 +1938,18 @@ int main() {
   {
     size_t est_surv = (size_t)(est_ev * 0.97);
     const double capf = getenv("CAPF") ? atof(getenv("CAPF")) : 1.0;
-    size_t pcap = (size_t)(est_surv / NT / P2USED * 1.4 * capf) + 64;
+    vector<size_t> pcaps(P2);
+    for (u32 k = 0; k < P2; k++) pcaps[k] = (size_t)((double)vpart[k] / NT * 1.2 * capf) + 32;
     atomic<u32> next{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
-      init_bufs(tl.pb, P2, pcap);
+      init_bufs_var(tl.pb, pcaps);
       tl.pbw.init(tl.pb);
       vector<u64> tab;  // (tag << 32) | (thread << 26 | index); empty = ~0
       auto rec = [&](u32 p, u32 code) -> ERec& {
         Buf<ERec>& b = TLS[code >> 26].eb[p];
         u32 i = code & ((1u << 26) - 1);
-        return i < b.n ? b.d[i] : b.ov[i - b.n];
+        return b.at(i);
       };
       for (;;) {
         u32 p = next.fetch_add(1);
@@ -1880,7 +1965,7 @@ int main() {
           Buf<ERec>& b = TLS[s].eb[p];
           size_t tot = b.size();
           for (size_t i = 0; i < tot; i++) {
-            ERec& r = i < b.n ? b.d[i] : b.ov[i - b.n];
+            ERec& r = b.at(i);
             u32 tag = (u32)(r.eh >> 20);
             u64 k = r.eh & mask;
             u64 me = ((u64)tag << 32) | ((u32)s << 26) | (u32)i;
@@ -1916,6 +2001,15 @@ int main() {
     });
   }
   LOG("dedup done");
+  if (VERBOSE) {
+    size_t eo = 0, et = 0, co = 0, ct = 0, po = 0, pt = 0;
+    for (auto& tl : TLS) {
+      for (auto& b : tl.eb) eo += b.ovsize(), et += b.size();
+      for (auto& b : tl.cb) co += b.ovsize(), ct += b.size();
+      for (auto& b : tl.pb) po += b.ovsize(), pt += b.size();
+    }
+    LOG("overflow: events %zu/%zu clicks %zu/%zu persons %zu/%zu", eo, et, co, ct, po, pt);
+  }
 
   // ---------------- phase 5: sessions
   {
@@ -1983,6 +2077,11 @@ int main() {
       cols[5] = PCol{"top_category", PT_BYTES, LT_STRING, true,
                      {{dh.data(), dh.size()}, {tl.o_def.p, (size_t)((n + 7) / 8)}, {tl.o_top.p, tl.o_top.n}}};
       write_parquet(ud + "/part-" + to_string(t) + ".parquet", n, cols);
+      // drop the column buffers now, in parallel, instead of at exit
+      for (TL::BB* bb : {&tl.o_uid, &tl.o_day, &tl.o_sess, &tl.o_ev, &tl.o_rev, &tl.o_top, &tl.o_def}) {
+        uintptr_t a0 = ((uintptr_t)bb->p + 4095) & ~(uintptr_t)4095, a1 = ((uintptr_t)bb->p + bb->cap) & ~(uintptr_t)4095;
+        if (bb->p && a1 > a0) madvise((void*)a0, a1 - a0, MADV_DONTNEED);
+      }
       wrote++;
     });
     // campaign_daily
@@ -2040,6 +2139,20 @@ int main() {
     });
   }
   LOG("released");
+  if (VERBOSE) {
+    string st = read_small("/proc/self/status");
+    size_t a = st.find("VmRSS");
+    size_t b = st.find("RssFile");
+    if (a != string::npos) fprintf(stderr, "%s", st.substr(a, st.find('\n', st.find("RssShmem")) - a).c_str());
+    (void)b;
+    fputc('\n', stderr);
+    if (getenv("SMAPS")) {
+      string sm = read_small("/proc/self/smaps");
+      FILE* fo = fopen(getenv("SMAPS"), "w");
+      fwrite(sm.data(), 1, sm.size(), fo);
+      fclose(fo);
+    }
+  }
   fflush(stderr);
   _exit(0);
 }
