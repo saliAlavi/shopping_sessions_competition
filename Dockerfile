@@ -9,8 +9,9 @@ WORKDIR /src
 COPY src/ /src/
 RUN g++ -O3 -march=x86-64-v3 -std=c++17 -static -o /pipeline main.cpp -lpthread
 
-FROM debian:bookworm-slim
+# The run image holds nothing but the binary: it needs no shell, libc or files.
+# The scorer runs it as uid 1000 with a read-only root filesystem and no network;
+# it reads $DATA_DIR (/data) and writes $OUTPUT_DIR (/output).
+FROM scratch
 COPY --from=build /pipeline /app/pipeline
-# The scorer runs as uid 1000 with a read-only root filesystem and no network.
-# Reads $DATA_DIR (/data), writes $OUTPUT_DIR (/output); nothing else is touched.
 CMD ["/app/pipeline"]

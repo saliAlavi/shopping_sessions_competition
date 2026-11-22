@@ -374,6 +374,8 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict
 // to the start of the next line.
 template <int K>
 __attribute__((always_inline)) static inline bool split_line(const char*& p, Fld* __restrict f) {
+  // the hardware prefetcher restarts at every 4 KB file page; fetch the text ahead ourselves
+  _mm_prefetch(p + 1024, _MM_HINT_T0);
   const __m256i cC = _mm256_set1_epi8(','), cN = _mm256_set1_epi8('\n'), cQ = _mm256_set1_epi8('"');
   const __m256i v0 = _mm256_loadu_si256((const __m256i*)p), v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
   const __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64)), v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
@@ -726,6 +728,7 @@ static const i64 D7 = 7LL * 86400000;
 static const i64 GAP = 1800000;
 static i64 DAY0;  // epoch day of WS
 static int ND;    // number of days
+static i64 DAYB[64];  // start of day k as an offset from WS (ms)
 
 static SMap PROD;  // product -> category index
 static SMap CAMP;  // campaign -> index
@@ -1066,10 +1069,11 @@ struct TL {  // thread-local state
   BB o_uid, o_day, o_sess, o_ev, o_rev, o_top, o_def;
   u64 o_rows = 0;
   struct CC {
-    u32 sess, psess, assist, pad;
+    u32 sess, psess;
     i64 rev;
   };
-  vector<CC> cc;  // [(camp)*ND + day]
+  vector<CC> cc;       // [(camp)*ND + day]
+  vector<u32> assist;  // same index; kept apart and small so it stays cache-resident
   i64 n_ev_lines = 0, n_cl_lines = 0;
 };
 static vector<TL> TLS;
@@ -1354,6 +1358,7 @@ struct SessCtx {
   vector<u64> ev;
   vector<Cl> cl;
   vector<u8> ra, rb;  // radix scratch (12-byte records)
+  vector<CRec> ca, cb2;
   vector<u32> cnt, ccount;
 };
 
@@ -1416,27 +1421,61 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   for (size_t i = 0; i < ne; i++) ev[cnt[B[i].loc]++] = B[i].val;
   // now cnt[i] = end of local i; start = cnt[i-1] (end of previous)
 
+  // clicks: exact LSD radix on ts (11+11+10 bits), then a stable scatter by person
   vector<u32>& cc = sc.ccount;
   cc.assign(NL + 1, 0);
   size_t nc = 0;
-  for (int t = 0; t < NT; t++) {
-    const Buf<CRec>& b = TLS[t].cb[p];
-    b.each([&](const CRec& x) { cc[x.person & LMASK]++; });
-    nc += b.size();
-  }
-  s = 0;
-  for (u32 i = 0; i < NL; i++) {
-    u32 c = cc[i];
-    cc[i] = s;
-    s += c;
-  }
-  cc[NL] = s;
+  for (int t = 0; t < NT; t++) nc += TLS[t].cb[p].size();
   if (sc.cl.size() < nc) sc.cl.resize(nc);
   Cl* cl = sc.cl.data();
-  for (int t = 0; t < NT; t++)
-    TLS[t].cb[p].each([&](const CRec& x) {
+  if (nc) {
+    if (sc.ca.size() < nc) {
+      sc.ca.resize(nc);
+      sc.cb2.resize(nc);
+    }
+    CRec* X = sc.ca.data();
+    CRec* Y = sc.cb2.data();
+    static thread_local u32 g0[2048], g1[2048], g2[1024];
+    memset(g0, 0, sizeof g0);
+    memset(g1, 0, sizeof g1);
+    memset(g2, 0, sizeof g2);
+    size_t i = 0;
+    for (int t = 0; t < NT; t++)
+      TLS[t].cb[p].each([&](const CRec& x) {
+        X[i++] = x;
+        g0[x.ts & 2047]++;
+        g1[(x.ts >> 11) & 2047]++;
+        g2[(x.ts >> 22) & 1023]++;
+        cc[x.person & LMASK]++;
+      });
+    u32 a = 0, b = 0, c = 0;
+    for (int k = 0; k < 2048; k++) {
+      u32 x0 = g0[k], x1 = g1[k];
+      g0[k] = a;
+      g1[k] = b;
+      a += x0;
+      b += x1;
+    }
+    for (int k = 0; k < 1024; k++) {
+      u32 x2 = g2[k];
+      g2[k] = c;
+      c += x2;
+    }
+    for (size_t k = 0; k < nc; k++) Y[g0[X[k].ts & 2047]++] = X[k];
+    for (size_t k = 0; k < nc; k++) X[g1[(Y[k].ts >> 11) & 2047]++] = Y[k];
+    for (size_t k = 0; k < nc; k++) Y[g2[(X[k].ts >> 22) & 1023]++] = X[k];
+    u32 s2 = 0;
+    for (u32 k = 0; k < NL; k++) {
+      u32 cn = cc[k];
+      cc[k] = s2;
+      s2 += cn;
+    }
+    cc[NL] = s2;
+    for (size_t k = 0; k < nc; k++) {
+      const CRec& x = Y[k];
       cl[cc[x.person & LMASK]++] = Cl{x.ts, (u32)(x.ref & 0xFFFF), x.ref >> 16};
-    });
+    }
+  }
 
   u32* ccnt = sc.ccnt.data();
   u32* apos = sc.apos.data();
@@ -1444,6 +1483,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
   i64* catsum = sc.catsum.data();
   vector<u32>& touched = sc.touched;
   TL::CC* CCA = tl.cc.data();
+  u32* ASSIST = tl.assist.data();
 
   u32 eprev = 0, cprev = 0;
   for (u32 li = 0; li < NL; li++) {
@@ -1459,21 +1499,8 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
     u32 n = eend - eb;
     Cl* C = cl + cb;
     u32 m = cend - cb;
-    if (m > 1) {
-      if (m <= 16) {
-        for (u32 i = 1; i < m; i++) {
-          Cl x = C[i];
-          u32 j = i;
-          while (j > 0 && C[j - 1].ts > x.ts) {
-            C[j] = C[j - 1];
-            j--;
-          }
-          C[j] = x;
-        }
-      } else {
-        sort(C, C + m, [](const Cl& a, const Cl& b) { return a.ts < b.ts; });
-      }
-    }
+    // the name bytes live in the mapped input: fetch a later person's ahead of its first row
+    if (li + 6 < NL && cnt[li + 6] != cnt[li + 5]) _mm_prefetch(NAMEP[person + 6], _MM_HINT_T0);
     // walk sessions
     i32 curday = -1;
     i32 d_sess = 0, d_ev = 0;
@@ -1532,11 +1559,13 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
       return j;
     };
     u32 nb_min = 0, nb_max = 0, nb_end = 0;
+    i32 dcur = 0;
     if (n) nb_end = bucket(0, nb_min, nb_max);
     while (i < n) {
       // a session starts with the pending bucket [i, nb_end)
       u32 st = nb_min;
-      i32 day = (i32)((WS + st) / 86400000 - DAY0);
+      while (dcur + 1 < ND && (i64)st >= DAYB[dcur + 1]) dcur++;
+      i32 day = dcur;
       if (day != curday) {
         flush();
         curday = day;
@@ -1604,7 +1633,7 @@ static void process_partition(u32 p, TL& tl, SessCtx& sc, u32 NL) {
           if (clickid_cmp(C[k].off, C[best].off) < 0) best = k;
         }
         credit = C[best].camp;
-        for (u32 cp : active) CCA[(size_t)cp * ND + day].assist++;
+        for (u32 cp : active) ASSIST[(size_t)cp * ND + day]++;
       } else {
         credit = NCAMP;  // organic
       }
@@ -1874,6 +1903,8 @@ int main() {
     DAY0 = WS / 86400000;
     ND = (int)((WE - 1) / 86400000 - DAY0 + 1);
     if (WE - CWS >= (1LL << 32)) die("window too long");
+    if (ND > 60) die("window too many days");
+    for (int k = 0; k <= ND; k++) DAYB[k] = (DAY0 + k) * 86400000LL - WS;
   }
 
   // files
@@ -2257,7 +2288,8 @@ int main() {
     size_t csz = (size_t)(NCAMP + 1) * ND;
     parallel([&](int t) {
       TL& tl = TLS[t];
-      tl.cc.assign(csz, TL::CC{0, 0, 0, 0, 0});
+      tl.cc.assign(csz, TL::CC{0, 0, 0});
+      tl.assist.assign(csz, 0);
       SessCtx sc;
       sc.ccnt.assign(NCAMP + 1, 0);
       sc.apos.assign(NCAMP + 1, 0);
@@ -2320,7 +2352,7 @@ int main() {
         cs[i] += tl.cc[i].sess;
         cps[i] += tl.cc[i].psess;
         crev[i] += tl.cc[i].rev;
-        cas[i] += tl.cc[i].assist;
+        cas[i] += tl.assist[i];
       }
     vector<string> cdat(7);
     u64 rows = 0;
