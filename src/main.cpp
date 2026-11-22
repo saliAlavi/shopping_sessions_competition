@@ -352,7 +352,11 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* f) {
 // ------------------------------------------------------------------ timestamps
 static i32 YDAYS[131];      // days from 1970-01-01 to Jan 1 of 1970 + i
 static u16 MDAYS[2][13];    // days before month m
+static i32 YMD[131 * 16];  // days from 1970-01-01 to (1970+i, m, 1)
+static u8 YDIM[131 * 16];  // days in month
+static void init_date_tables2();
 static void init_date_tables() {
+  init_date_tables2();
   i32 acc = 0;
   for (int i = 0; i < 131; i++) {
     YDAYS[i] = acc;
@@ -369,6 +373,19 @@ static void init_date_tables() {
   }
 }
 static inline i64 days_from_civil(i64 y, unsigned m, unsigned d);
+static void init_date_tables2() {
+  static const int dm[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  i32 acc = 0;
+  for (int i = 0; i < 131; i++) {
+    int y = 1970 + i;
+    bool lp = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    for (int m = 1; m <= 12; m++) {
+      YMD[i * 16 + m] = acc;
+      YDIM[i * 16 + m] = (u8)(dm[m] + (m == 2 && lp));
+      acc += YDIM[i * 16 + m];
+    }
+  }
+}
 static inline i64 civil_days(unsigned y, unsigned m, unsigned d, bool lp) {
   if (LIKELY(y >= 1970 && y < 2101)) return YDAYS[y - 1970] + MDAYS[lp][m] + d - 1;
   return days_from_civil(y, m, d);
@@ -431,8 +448,15 @@ static inline bool parse_ts(const char* p, u32 n, i64& out) {
 }
 // ingest_ts is always valid F1: epoch seconds.
 __attribute__((always_inline)) static inline i64 parse_f1_sec(const char* p) {
-  unsigned y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14),
-           s = d2(p + 17);
+  __m128i t = _mm_sub_epi8(_mm_loadu_si128((const __m128i*)p), _mm_set1_epi8('0'));
+  __m128i g = _mm_shuffle_epi8(t, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+  __m128i pr = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+  unsigned y = (unsigned)_mm_extract_epi16(pr, 0) * 100u + (unsigned)_mm_extract_epi16(pr, 1);
+  unsigned mo = (unsigned)_mm_extract_epi16(pr, 2), d = (unsigned)_mm_extract_epi16(pr, 3);
+  unsigned h = (unsigned)_mm_extract_epi16(pr, 4), mi = (unsigned)_mm_extract_epi16(pr, 5);
+  unsigned s = (unsigned)(p[17] - '0') * 10 + (unsigned)(p[18] - '0');
+  unsigned yi = y - 1970;
+  if (LIKELY(yi < 131 && mo - 1 < 12)) return (i64)(YMD[yi * 16 + mo] + (i32)d - 1) * 86400 + h * 3600 + mi * 60 + s;
   return civil_days(y, mo, d, leap(y)) * 86400 + h * 3600 + mi * 60 + s;
 }
 
@@ -471,13 +495,19 @@ __attribute__((always_inline)) static inline i64 dt19_simd(const char* p) {
   __m128i lo = _mm256_castsi256_si128(t);
   __m128i g = _mm_shuffle_epi8(lo, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
   __m128i pr = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
-  alignas(16) u16 a[8];
-  _mm_store_si128((__m128i*)a, pr);
-  unsigned y = a[0] * 100u + a[1], mo = a[2], d = a[3], h = a[4], mi = a[5];
+  unsigned y = (unsigned)_mm_extract_epi16(pr, 0) * 100u + (unsigned)_mm_extract_epi16(pr, 1);
+  unsigned mo = (unsigned)_mm_extract_epi16(pr, 2), d = (unsigned)_mm_extract_epi16(pr, 3);
+  unsigned h = (unsigned)_mm_extract_epi16(pr, 4), mi = (unsigned)_mm_extract_epi16(pr, 5);
   unsigned s = (unsigned)(p[17] - '0') * 10 + (unsigned)(p[18] - '0');
-  if (mo - 1 > 11 || d - 1 > 30 || h > 23 || mi > 59 || s > 59) return -1;
+  if (mo - 1 > 11 || h > 23 || mi > 59 || s > 59) return -1;
+  unsigned yi = y - 1970;
+  if (LIKELY(yi < 131)) {
+    unsigned ix = yi * 16 + mo;
+    if (d - 1 >= YDIM[ix]) return -1;
+    return (i64)(YMD[ix] + (i32)d - 1) * 86400 + h * 3600 + mi * 60 + s;
+  }
   bool lp = leap(y);
-  if (d > (unsigned)(DIM[mo] + (mo == 2 && lp))) return -1;
+  if (d - 1 >= (unsigned)(DIM[mo] + (mo == 2 && lp))) return -1;
   return civil_days(y, mo, d, lp) * 86400 + h * 3600 + mi * 60 + s;
 }
 __attribute__((always_inline)) static inline bool parse_ts_fast(const char* p, u32 n, i64& out) {
