@@ -374,8 +374,10 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict
 // to the start of the next line.
 template <int K>
 __attribute__((always_inline)) static inline bool split_line(const char*& p, Fld* __restrict f) {
-  // the hardware prefetcher restarts at every 4 KB file page; fetch the text ahead ourselves
-  _mm_prefetch(p + 1024, _MM_HINT_T0);
+  // the hardware prefetcher restarts at every 4 KB file page; fetch the text ahead
+  // ourselves (two cache lines per line of input, so every line gets covered)
+  _mm_prefetch(p + 1536, _MM_HINT_T0);
+  _mm_prefetch(p + 1600, _MM_HINT_T0);
   const __m256i cC = _mm256_set1_epi8(','), cN = _mm256_set1_epi8('\n'), cQ = _mm256_set1_epi8('"');
   const __m256i v0 = _mm256_loadu_si256((const __m256i*)p), v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
   const __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64)), v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
@@ -1920,7 +1922,7 @@ int main() {
   // user table + id space
   {
     double lines = ebytes / 75.0 + cbytes / 50.0 + (double)lb / 10.0;
-    u64 want = (u64)(lines / 8) + 65536;
+    u64 want = (u64)(lines / 4) + 65536;  // low load factor: a first-probe miss is a mispredicted branch
     int bits = 16;
     while ((1ull << bits) < want) bits++;
     UT = (Slot*)vmalloc(sizeof(Slot) << bits, true);
