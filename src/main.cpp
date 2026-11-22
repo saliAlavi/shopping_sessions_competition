@@ -429,7 +429,7 @@ static inline bool parse_ts(const char* p, u32 n, i64& out) {
   return true;
 }
 // ingest_ts is always valid F1: epoch seconds.
-static inline i64 parse_f1_sec(const char* p) {
+__attribute__((always_inline)) static inline i64 parse_f1_sec(const char* p) {
   unsigned y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14),
            s = d2(p + 17);
   return civil_days(y, mo, d, leap(y)) * 86400 + h * 3600 + mi * 60 + s;
@@ -440,7 +440,7 @@ alignas(16) static const u8 KEEPMASK[32] = {0,    0,    0,    0,    0,    0,    
                                             0,    0,    0,    0,    0,    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
                                             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // F3: n digits (1..16) right-aligned; reads 16 bytes ending at p+n.
-static inline bool f3_simd(const char* p, u32 n, i64& out) {
+__attribute__((always_inline)) static inline bool f3_simd(const char* p, u32 n, i64& out) {
   __m128i v = _mm_loadu_si128((const __m128i*)(p + n - 16));
   __m128i t = _mm_sub_epi8(v, _mm_set1_epi8('0'));
   __m128i keep = _mm_loadu_si128((const __m128i*)(KEEPMASK + n));
@@ -479,7 +479,7 @@ __attribute__((always_inline)) static inline i64 dt19_simd(const char* p) {
   if (d > (unsigned)(DIM[mo] + (mo == 2 && lp))) return -1;
   return civil_days(y, mo, d, lp) * 86400 + h * 3600 + mi * 60 + s;
 }
-static inline bool parse_ts_fast(const char* p, u32 n, i64& out) {
+__attribute__((always_inline)) static inline bool parse_ts_fast(const char* p, u32 n, i64& out) {
   if (n == 20) {
     if (p[4] == '-') {
       if (p[19] != 'Z') return false;
@@ -620,6 +620,65 @@ static int ND;    // number of days
 
 static SMap PROD;  // product -> category index
 static SMap CAMP;  // campaign -> index
+
+// Fast exact lookup for IDs of the form <prefix><decimal without leading zero>.
+// If every ID in the file has that form, a string not of that form cannot match.
+struct DirectIds {
+  bool ok = false;
+  string pre;
+  vector<u32> val;  // number -> value, ~0u if absent
+  static bool canon(const char* p, u32 n, const string& pre, u64& num) {
+    u32 k = (u32)pre.size();
+    if (n <= k || n > k + 9 || memcmp(p, pre.data(), k) != 0) return false;
+    if (p[k] == '0') return false;
+    u64 v = 0;
+    for (u32 i = k; i < n; i++) {
+      unsigned c = (unsigned)(p[i] - '0');
+      if (c > 9) return false;
+      v = v * 10 + c;
+    }
+    num = v;
+    return true;
+  }
+  void build(const vector<pair<string, u32>>& ids, const string& prefix) {
+    pre = prefix;
+    u64 mx = 0;
+    for (auto& e : ids) {
+      u64 v;
+      if (!canon(e.first.data(), (u32)e.first.size(), pre, v)) return;
+      mx = max(mx, v);
+    }
+    if (mx > 50000000) return;
+    val.assign(mx + 1, ~0u);
+    for (auto& e : ids) {
+      u64 v;
+      canon(e.first.data(), (u32)e.first.size(), pre, v);
+      val[v] = e.second;
+    }
+    ok = true;
+  }
+  // returns 1 found (out set), 0 absent, -1 unknown (fall back to the map)
+  inline int find(const char* p, u32 n, u32& out) const {
+    if (!ok) return -1;
+    u64 v;
+    if (!canon(p, n, pre, v) || v >= val.size()) return 0;
+    out = val[v];
+    return out != ~0u;
+  }
+};
+static DirectIds PRODD, CAMPD;
+static inline u32 prod_cat(const char* p, u32 n) {
+  u32 v;
+  int r = PRODD.find(p, n, v);
+  if (r < 0) return PROD.find(p, n);
+  return r ? v : ~0u;
+}
+static inline u32 camp_idx(const char* p, u32 n) {
+  u32 v;
+  int r = CAMPD.find(p, n, v);
+  if (r < 0) return CAMP.find(p, n);
+  return r ? v : ~0u;
+}
 static vector<string> CATS;
 static vector<string> CATLP;  // length-prefixed category names
 static vector<string> CHANNELS, CAMPIDS;
@@ -924,7 +983,7 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
         u32 v = 0;
         for (u32 k = i; k < pr.n; k++) v = v * 10 + (u32)(pr.p[k] - '0');
         if (v < 1 || v > 10000000) break;
-        u32 cat = PROD.find(f[5].p, f[5].n);
+        u32 cat = prod_cat(f[5].p, f[5].n);
         if (cat == ~0u) cat = UNKNOWN_CAT;
         pay = mkpay(2, cat, v);
       } else {
@@ -977,7 +1036,7 @@ static void parse_clicks_chunk(const Chunk& c, TL& tl) {
     i64 ts;
     if (!parse_ts_fast(f[3].p, f[3].n, ts)) continue;
     if (ts < CWS || ts >= WE) continue;
-    u32 cmp = CAMP.find(f[2].p, f[2].n);
+    u32 cmp = camp_idx(f[2].p, f[2].n);
     if (cmp == ~0u) continue;
     Pend q;
     q.uh = hash_str(f[1].p, f[1].n) | 1;
@@ -1013,7 +1072,7 @@ static void radix_sort_ts(u64* a, u64* tmp, size_t n) {
 }
 static inline void sort_u64(u64* a, size_t n, vector<u64>& tmp) {
   if (n <= 1) return;
-  if (n <= 24) {
+  if (n <= 32) {
     for (size_t i = 1; i < n; i++) {
       u64 x = a[i];
       size_t j = i;
@@ -1023,7 +1082,7 @@ static inline void sort_u64(u64* a, size_t n, vector<u64>& tmp) {
       }
       a[j] = x;
     }
-  } else if (n < 4096) {
+  } else if (n < 512) {
     sort(a, a + n);
   } else {
     if (tmp.size() < n) tmp.resize(n);
@@ -1538,12 +1597,15 @@ int main() {
     }
     UNKNOWN_CAT = (u32)(lower_bound(cats.begin(), cats.end(), string("unknown")) - cats.begin());
     PROD.init(rows.size() + 1);
+    vector<pair<string, u32>> ids;
     for (auto& r : rows) {
       u32 ci = (u32)(lower_bound(cats.begin(), cats.end(), r.second) - cats.begin());
       string key = r.first;
       key.append(16, '\0');
-      PROD.insert(key.data(), (u32)r.first.size(), ci);
+      u32 got = PROD.insert(key.data(), (u32)r.first.size(), ci);
+      ids.push_back({r.first, got});
     }
+    PRODD.build(ids, "p");
   }
   // campaigns
   {
@@ -1560,6 +1622,11 @@ int main() {
       }
     }
     NCAMP = (u32)CAMPIDS.size();
+    {
+      vector<pair<string, u32>> ids;
+      for (u32 i = 0; i < NCAMP; i++) ids.push_back({CAMPIDS[i], i});
+      CAMPD.build(ids, "c_");
+    }
     if (NCAMP >= 65535) die("too many campaigns");
   }
   LOG("small tables: %zu cats, %u campaigns, %d days", CATS.size(), NCAMP, ND);
@@ -1699,8 +1766,9 @@ int main() {
 
   // ---------------- phase 3: events + clicks
   {
-    size_t ecap = (size_t)(est_ev / NT / P1 * 1.3) + 64;
-    size_t ccap = (size_t)(est_cl / NT / P2USED * 1.4) + 64;
+    const double capf = getenv("CAPF") ? atof(getenv("CAPF")) : 1.0;  // test knob: shrink to exercise overflow paths
+    size_t ecap = (size_t)(est_ev / NT / P1 * 1.3 * capf) + 64;
+    size_t ccap = (size_t)(est_cl / NT / P2USED * 1.4 * capf) + 64;
     parallel([&](int t) {
       init_bufs(TLS[t].eb, P1, ecap);
       init_bufs(TLS[t].cb, P2, ccap);
@@ -1727,7 +1795,8 @@ int main() {
   // ---------------- phase 4: dedup
   {
     size_t est_surv = (size_t)(est_ev * 0.97);
-    size_t pcap = (size_t)(est_surv / NT / P2USED * 1.4) + 64;
+    const double capf = getenv("CAPF") ? atof(getenv("CAPF")) : 1.0;
+    size_t pcap = (size_t)(est_surv / NT / P2USED * 1.4 * capf) + 64;
     atomic<u32> next{0};
     parallel([&](int t) {
       TL& tl = TLS[t];
