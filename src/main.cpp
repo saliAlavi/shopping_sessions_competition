@@ -766,8 +766,59 @@ struct Buf {
   size_t size() const { return n + ov.size(); }
 };
 
+// Write-combining scatter: G records per partition are staged in a small cache-resident
+// area and flushed with non-temporal stores (no read-for-ownership of the destination).
+template <class T, int G>
+struct WC {
+  static_assert((sizeof(T) * G) % 64 == 0, "group must be whole cache lines");
+  vector<Buf<T>>* bufs = nullptr;
+  T* stage = nullptr;  // [parts][G], 64-byte aligned
+  u8* cnt = nullptr;
+  size_t parts = 0;
+  void init(vector<Buf<T>>& b) {
+    bufs = &b;
+    parts = b.size();
+    stage = (T*)aligned_alloc(64, ((sizeof(T) * G * parts) + 63) & ~(size_t)63);
+    cnt = (u8*)calloc(parts, 1);
+  }
+  inline void push(size_t k, const T& x) {
+    u32 c = cnt[k];
+    T* sg = stage + k * G;
+    sg[c] = x;
+    if (UNLIKELY(++c == G)) {
+      flush_full(k, sg);
+      c = 0;
+    }
+    cnt[k] = (u8)c;
+  }
+  void flush_full(size_t k, T* sg) {
+    Buf<T>& b = (*bufs)[k];
+    if (LIKELY(b.ov.empty() && b.n + G <= b.cap)) {
+      const __m256i* src = (const __m256i*)sg;
+      __m256i* dst = (__m256i*)(b.d + b.n);
+      for (size_t i = 0; i < sizeof(T) * G / 32; i++) _mm256_stream_si256(dst + i, _mm256_load_si256(src + i));
+      b.n += G;
+    } else {
+      for (int i = 0; i < G; i++) b.push(sg[i]);
+    }
+  }
+  void finish() {
+    for (size_t k = 0; k < parts; k++) {
+      T* sg = stage + k * G;
+      for (u32 i = 0; i < cnt[k]; i++) (*bufs)[k].push(sg[i]);
+      cnt[k] = 0;
+    }
+    _mm_sfence();
+    free(stage);
+    free(cnt);
+    stage = nullptr;
+    cnt = nullptr;
+  }
+};
+
 template <class T>
 static void init_bufs(vector<Buf<T>>& v, size_t parts, size_t cap) {
+  cap = (cap + 15) & ~(size_t)15;  // whole write-combining groups keep streamed stores aligned
   v.resize(parts);
   T* mem = (T*)vmalloc(sizeof(T) * cap * parts + 64, true);
   for (size_t i = 0; i < parts; i++) {
@@ -802,6 +853,9 @@ struct TL {  // thread-local state
   vector<Buf<ERec>> eb;
   vector<Buf<PE>> pb;
   vector<Buf<CRec>> cb;
+  WC<ERec, 8> ebw;
+  WC<PE, 16> pbw;
+  WC<CRec, 4> cbw;
   vector<pair<u32, u32>> edges;
   IdAlloc al;
   // outputs
@@ -942,7 +996,7 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
   u32 head = 0, tail = 0;
   auto finish = [&](Pend& q) {
     q.r.person = uget<false>(q.uh, q.up, q.un, tl.al);
-    tl.eb[q.r.eh >> p1shift].push(q.r);
+    tl.ebw.push(q.r.eh >> p1shift, q.r);
   };
   i64 lines = 0;
   while (p < end) {
@@ -992,7 +1046,7 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
       r.val = ((u64)(u32)(ts - WS) << 32) | pay;
     } while (0);
     if (r.val == INVALID) {
-      tl.eb[r.eh >> p1shift].push(r);
+      tl.ebw.push(r.eh >> p1shift, r);
       continue;
     }
     Pend q;
@@ -1025,7 +1079,7 @@ static void parse_clicks_chunk(const Chunk& c, TL& tl) {
   auto finish = [&](Pend& q) {
     u32 person = uget<false>(q.uh, q.up, q.un, tl.al);
     q.r.person = person;
-    tl.cb[person >> P2S].push(q.r);
+    tl.cbw.push(person >> P2S, q.r);
   };
   i64 lines = 0;
   while (p < end) {
@@ -1772,6 +1826,8 @@ int main() {
     parallel([&](int t) {
       init_bufs(TLS[t].eb, P1, ecap);
       init_bufs(TLS[t].cb, P2, ccap);
+      TLS[t].ebw.init(TLS[t].eb);
+      TLS[t].cbw.init(TLS[t].cb);
     });
     vector<Chunk> ch;
     make_chunks(ef, 1, 4 << 20, ch);
@@ -1787,6 +1843,8 @@ int main() {
         else
           parse_clicks_chunk(ch[i], tl);
       }
+      tl.ebw.finish();
+      tl.cbw.finish();
     });
   }
   u32 NIDS = NEXT_ID.load();
@@ -1801,6 +1859,7 @@ int main() {
     parallel([&](int t) {
       TL& tl = TLS[t];
       init_bufs(tl.pb, P2, pcap);
+      tl.pbw.init(tl.pb);
       vector<u64> tab;  // (tag << 32) | (thread << 26 | index); empty = ~0
       auto rec = [&](u32 p, u32 code) -> ERec& {
         Buf<ERec>& b = TLS[code >> 26].eb[p];
@@ -1850,9 +1909,10 @@ int main() {
         // pass 2: sequential scatter of the surviving valid copies by person range
         for (int s = 0; s < NT; s++)
           TLS[s].eb[p].each([&](const ERec& r) {
-            if (r.val != INVALID) tl.pb[r.person >> P2S].push(PE{r.person, r.val});
+            if (r.val != INVALID) tl.pbw.push(r.person >> P2S, PE{r.person, r.val});
           });
       }
+      tl.pbw.finish();
     });
   }
   LOG("dedup done");
