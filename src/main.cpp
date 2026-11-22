@@ -367,6 +367,66 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict
   return false;
 }
 
+// Line-anchored splitter. The 128 bytes at the line start are classified once and the
+// first K delimiters are peeled off a two-word mask with conditional moves, so a
+// well-formed line of up to 128 bytes costs no data-dependent branch. Longer lines
+// take the exact scalar path. Returns false for a malformed line; p always advances
+// to the start of the next line.
+template <int K>
+__attribute__((always_inline)) static inline bool split_line(const char*& p, Fld* __restrict f) {
+  const __m256i cC = _mm256_set1_epi8(','), cN = _mm256_set1_epi8('\n'), cQ = _mm256_set1_epi8('"');
+  const __m256i v0 = _mm256_loadu_si256((const __m256i*)p), v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+  const __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64)), v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
+#define SS_DM(v) ((u64)(u32)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, cC), _mm256_cmpeq_epi8(v, cN))))
+#define SS_QM(v) ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, cQ)))
+  u64 a = SS_DM(v0) | (SS_DM(v1) << 32), b = SS_DM(v2) | (SS_DM(v3) << 32);
+  const u64 q0 = SS_QM(v0) | (SS_QM(v1) << 32), q1 = SS_QM(v2) | (SS_QM(v3) << 32);
+#undef SS_DM
+#undef SS_QM
+  u32 pos[K];
+#pragma GCC unroll 8
+  for (int i = 0; i < K; i++) {
+    const bool lo = a != 0;
+    const u64 w = lo ? a : b;
+    pos[i] = (u32)_tzcnt_u64(w) + (lo ? 0u : 64u);
+    const u64 b2 = b & (b - 1);
+    b = lo ? b : b2;
+    a &= a - 1;
+  }
+  const u32 last = pos[K - 1];
+  if (UNLIKELY(last >= 128)) {  // fewer than K delimiters in 128 bytes: a long line
+    bool ok;
+    p = split<K>(p, f, ok);
+    return ok;
+  }
+  u32 bad = (u32)(p[last] != '\n');
+  u8 cor = ',';
+  u32 nq = 0, s = 0;
+#pragma GCC unroll 8
+  for (int i = 0; i < K; i++) {
+    const u32 d = pos[i];
+    if (i < K - 1) cor |= (u8)p[d];
+    const u32 qs = (u32)(p[s] == '"');
+    const u32 qe = (u32)((p + d)[-1] == '"');
+    const u32 len = d - s;
+    bad |= (qs ^ qe) | (qs & (u32)(len < 2));
+    f[i].p = p + s + qs;
+    f[i].n = len - 2 * qs;
+    nq += qs;
+    s = d + 1;
+  }
+  // every quote of the line must be one of the 2 * nq wrapping quotes
+  const u64 ql0 = _bzhi_u64(q0, last);  // index >= 64 keeps the whole word
+  const u64 ql1 = last > 64 ? _bzhi_u64(q1, last - 64) : 0;
+  bad |= (u32)(cor != ',') | (u32)((u32)(__builtin_popcountll(ql0) + __builtin_popcountll(ql1)) != 2 * nq);
+  if (UNLIKELY(bad)) {
+    p = next_line(p);
+    return false;
+  }
+  p += last + 1;
+  return true;
+}
+
 // ------------------------------------------------------------------ timestamps
 static i32 YDAYS[131];      // days from 1970-01-01 to Jan 1 of 1970 + i
 static u16 MDAYS[2][13];    // days before month m
@@ -1054,9 +1114,6 @@ static void parse_links_chunk(const Chunk& c, TL& tl) {
   const char* p = chunk_start(c);
   const char* end = c.f->data + c.e;
   if (p >= end) return;
-  DIt2 it;
-  it.init(p);
-  i64 qs0 = 0;
   struct Pend {
     u64 ha, hb;
     const char *pa, *pb;
@@ -1070,7 +1127,7 @@ static void parse_links_chunk(const Chunk& c, TL& tl) {
   };
   while (p < end) {
     Fld f[2];
-    bool ok = split2<2>(p, it, qs0, f);
+    bool ok = split_line<2>(p, f);
     if (!ok || !f[0].n || !f[1].n) continue;
     Pend q;
     q.ha = hash_str(f[0].p, f[0].n) | 1;
@@ -1116,9 +1173,6 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
   const char* p = chunk_start(c);
   const char* end = c.f->data + c.e;
   if (p >= end) return;
-  DIt2 it;
-  it.init(p);
-  i64 qs0 = 0;
   struct Pend {
     u64 uh;
     const char* up;
@@ -1134,7 +1188,7 @@ static void parse_events_chunk(const Chunk& c, TL& tl) {
   i64 lines = 0;
   while (p < end) {
     Fld f[7];
-    bool ok = split2<7>(p, it, qs0, f);
+    bool ok = split_line<7>(p, f);
     lines++;
     if (UNLIKELY(!ok || f[0].n == 0)) continue;
     ERec r;
@@ -1199,9 +1253,6 @@ static void parse_clicks_chunk(const Chunk& c, TL& tl) {
   const char* p = chunk_start(c);
   const char* end = c.f->data + c.e;
   if (p >= end) return;
-  DIt2 it;
-  it.init(p);
-  i64 qs0 = 0;
   struct Pend {
     u64 uh;
     const char* up;
@@ -1217,7 +1268,7 @@ static void parse_clicks_chunk(const Chunk& c, TL& tl) {
   i64 lines = 0;
   while (p < end) {
     Fld f[4];
-    bool ok = split2<4>(p, it, qs0, f);
+    bool ok = split_line<4>(p, f);
     lines++;
     if (UNLIKELY(!ok || f[0].n == 0 || f[1].n == 0)) continue;
     i64 ts;
@@ -1864,31 +1915,59 @@ int main() {
   auto small_job = [&]() {
   // products & categories
   {
-    vector<pair<string, string>> rows;
-    load_small_table(DATA + "/products.csv", rows);
-    vector<string> cats;
-    for (auto& r : rows) cats.push_back(r.second);
-    cats.push_back("unknown");
-    sort(cats.begin(), cats.end());
-    cats.erase(unique(cats.begin(), cats.end()), cats.end());
-    if (cats.size() > 64) die("too many categories");
-    CATS = cats;
-    for (auto& c : cats) {
+    string txt = read_small(DATA + "/products.csv");
+    if (!txt.empty() && txt.back() != '\n') txt.push_back('\n');
+    size_t real = txt.size();
+    txt.append(64, '\0');
+    vector<string> names;  // in order of first appearance; "unknown" first
+    names.push_back("unknown");
+    struct PR {
+      const char* p;
+      u32 n, c;
+    };
+    vector<PR> prs;
+    prs.reserve(real / 8 + 16);
+    u32 lastc = 0;
+    const char* q = txt.data();
+    const char* qend = txt.data() + real;
+    if (real) q = next_line(q);
+    while (q < qend) {
+      Fld f[2];
+      bool ok;
+      const char* nx = split<2>(q, f, ok);
+      if (ok) {
+        u32 c = lastc;
+        if (!(names[c].size() == f[1].n && memcmp(names[c].data(), f[1].p, f[1].n) == 0)) {
+          for (c = 0; c < names.size(); c++)
+            if (names[c].size() == f[1].n && memcmp(names[c].data(), f[1].p, f[1].n) == 0) break;
+          if (c == names.size()) names.push_back(string(f[1].p, f[1].n));
+          lastc = c;
+        }
+        prs.push_back(PR{f[0].p, f[0].n, c});
+      }
+      q = nx;
+    }
+    if (names.size() > 64) die("too many categories");
+    vector<u32> ord(names.size()), rank(names.size());
+    for (u32 i = 0; i < ord.size(); i++) ord[i] = i;
+    sort(ord.begin(), ord.end(), [&](u32 x, u32 y) { return names[x] < names[y]; });
+    for (u32 i = 0; i < ord.size(); i++) {
+      rank[ord[i]] = i;
+      CATS.push_back(names[ord[i]]);
+    }
+    for (auto& c : CATS) {
       string lp(4, '\0');
       u32 n = (u32)c.size();
       memcpy(&lp[0], &n, 4);
       CATLP.push_back(lp + c);
     }
-    UNKNOWN_CAT = (u32)(lower_bound(cats.begin(), cats.end(), string("unknown")) - cats.begin());
+    UNKNOWN_CAT = rank[0];
     vector<pair<string, u32>> ids;
-    ids.reserve(rows.size());
-    for (auto& r : rows) {
-      u32 ci = (u32)(lower_bound(cats.begin(), cats.end(), r.second) - cats.begin());
-      ids.push_back({r.first, ci});
-    }
+    ids.reserve(prs.size());
+    for (auto& r : prs) ids.push_back({string(r.p, r.n), rank[r.c]});
     PRODD.build(ids, "p");
     if (!PRODD.ok) {  // general fallback map, only when ids are not all canonical
-      PROD.init(rows.size() + 1);
+      PROD.init(ids.size() + 1);
       for (auto& r : ids) {
         string key = r.first;
         key.append(16, '\0');
@@ -1925,10 +2004,10 @@ int main() {
     auto sample = [](vector<File>& fs, double def) {
       size_t bytes = 0, lines = 0;
       for (auto& f : fs) {
-        size_t n = min(f.size, (size_t)(1 << 20));
+        size_t n = min(f.size, (size_t)(128 << 10));
         for (size_t i = 0; i < n; i++) lines += f.data[i] == '\n';
         bytes += n;
-        if (bytes > (4 << 20)) break;
+        if (bytes > (1 << 20)) break;
       }
       return lines > 100 ? (double)bytes / lines : def;
     };
@@ -1938,7 +2017,7 @@ int main() {
   est_ev = ebytes / ev_line + 1000;
   est_cl = cbytes / cl_line + 1000;
   P1B = 4;
-  while (P1B < 13 && (est_ev / (1u << P1B)) > 40000) P1B++;
+  while (P1B < 10 && (est_ev / (1u << P1B)) > 40000) P1B++;  // at most 1024: the staging area must stay in L2
   if (getenv("P1B")) P1B = atoi(getenv("P1B"));
   P1 = 1u << P1B;
 
@@ -1946,7 +2025,7 @@ int main() {
     // person partitions are id ranges of 1 << P2S; ids never exceed the table capacity
     // (plus partially used allocation blocks), so P2 partitions cover every id.
     double est_ids = est_ev / 12.0 + 1024;
-    double want_parts = est_ev / 24000.0;
+    double want_parts = min(est_ev / 24000.0, 1400.0);
     P2S = 6;
     while (P2S < 20 && est_ids / (double)(1u << P2S) > want_parts) P2S++;
     if (getenv("P2S")) P2S = atoi(getenv("P2S"));
