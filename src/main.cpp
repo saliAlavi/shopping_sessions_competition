@@ -115,6 +115,7 @@ __attribute__((always_inline)) static inline u64 hash_str(const char* p, u32 n) 
       a = ld64(p);
       b = ld64(p + 8) & (~0ull >> (128 - 8 * n));
     }
+    return mum(a ^ s1, b ^ seed);
   } else {
     u32 i = n;
     const char* q = p;
@@ -321,6 +322,7 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict
   const char* d = nullptr;
   u32 bad = 0;
   u32 nq = 0;
+  u8 cor = 0;
 #pragma GCC unroll 8
   for (int i = 0; i < K; i++) {
     while (UNLIKELY(m == 0)) {
@@ -330,11 +332,11 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict
     }
     d = blk + __builtin_ctzll(m);
     m &= m - 1;
-    char c = *d;
+    // delimiters are only ',' (0x2C) or '\n' (0x0A): OR-ing the separators must give exactly ','
     if (i < K - 1)
-      bad |= (u32)(c != ',');
+      cor |= (u8)*d;
     else
-      bad |= (u32)(c != '\n');
+      bad |= (u32)(*d != '\n');
     u32 qs = (u32)(s[0] == '"');
     u32 qe = (u32)(d[-1] == '"');
     u32 len = (u32)(d - s);
@@ -344,6 +346,7 @@ static inline bool split2(const char*& p, DIt2& it, i64& qstart, Fld* __restrict
     nq += qs;
     s = d + 1;
   }
+  if (K > 1) bad |= (u32)(cor != ',');
   u32 o = (u32)(d - blk);
   i64 qend = qcum + __builtin_popcountll(q & ((1ull << o) - 1));
   bad |= (u32)((qend - qstart) != (i64)(2 * nq));
